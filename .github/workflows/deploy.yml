@@ -1,0 +1,35 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    if: github.event_name == 'push'
+    environment: production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: deployment check
+        uses: github/branch-deploy@f0984057ffe1aa340aa017b6eafb894310aed88e # pin@v12.0.0
+        id: deployment-check
+        with:
+          merge_deploy_mode: "true"
+          environment: production
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v6
+        if: ${{ steps.deployment-check.outputs.continue == 'true' }}
+        with:
+          ref: ${{ steps.deployment-check.outputs.sha }}
+
+      - name: SSH Remote Deploy
+        if: ${{ steps.deployment-check.outputs.continue == 'true' }}
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # pin@v1.2.5
+        with:
+          host: ${{ secrets.SSH_HOST_V2 }}
+          username: ${{ secrets.SSH_USERNAME_V2 }}
+          key: ${{ secrets.SSH_KEY_V2 }}
+          port: ${{ secrets.SSH_PORT }}
+          script: ~/tarkov-data-manager/script/deploy -r "main" -d "/home/ubuntu/tarkov-data-manager"

@@ -1,0 +1,595 @@
+import midmean from 'compute-midmean';
+
+import imgGen from 'tarkov-dev-image-generator';
+
+import normalizeName from './normalize-name.js';
+import db from './db-connection.mjs';
+import gameModes from './game-modes.mjs';
+import emitter from './emitter.mjs';
+import s3 from './upload-s3.mjs';
+import dogtags from './dogtags.mjs';
+import { camelCaseToSnakeCase } from './string-functions.mjs';
+
+const myData = new Map();
+let lastRefresh = new Date(0);
+
+const getInterquartileMean = (validValues) => {
+    if(validValues.length === 0){
+        return 0;
+    }
+
+    if(validValues.length === 1){
+        return validValues[0];
+    }
+
+    if(validValues.length === 2){
+        return Math.floor((validValues[0] + validValues[1]) / 2)
+    }
+
+    const sortedValues = validValues.sort((a, b) => a - b);
+
+    return Math.floor(midmean(sortedValues, true));
+
+    // if(validValues[0].item_id === '59fb023c86f7746d0d4b423c'){
+    //     console.log(sortedValues);
+    // }
+
+    // let sum = 0;
+    // let lastPrice = 0;
+    // let includedCount = 0;
+    // for(const currentPrice of sortedValues){
+    //     // Skip anything 10x the last value. Should skip packs
+    //     if(currentPrice > lastPrice * 10 && lastPrice > 0){
+    //         break;
+    //     }
+
+    //     includedCount = includedCount + 1;
+    //     lastPrice = currentPrice;
+    //     sum = sum + currentPrice;
+    // }
+
+    // return Math.floor(sum / includedCount);
+};
+
+const removeItemImages = async (item) => {
+    if (!item) {
+        return;
+    }
+    if (!item.types.includes('preset')) {
+        return;
+    }
+    const files = [];
+    const s3Bucket = process.env.S3_BUCKET;
+    if (!s3Bucket) {
+        return;
+    }
+    for (const imgKey in imgGen.imageFunctions.imageSizes) {
+        const imgType = imgGen.imageFunctions.imageSizes[imgKey];
+        if (!item[imgType.field]) {
+            continue;
+        }
+        files.push(item[imgType.field].replace(`${s3Bucket}/`, ''));
+    }
+    if (!files.length) {
+        return;
+    }
+    await Promise.all(files.map(filename => s3.deleteFromBucket(filename)));
+};
+
+const methods = {
+    get: async (forceRefresh = false) => {
+        // refresh if data hasn't been loaded, it's a forced refresh, or if it's been > 10 minutes
+        if (!myData.size || forceRefresh || new Date() - 1000 * 60 * 10 > lastRefresh) {
+            return methods.refresh().finally(() => {
+                emitter.emit('dbItemsLoaded', myData);
+            });
+        }
+        return myData;
+    },
+    getPresets: () => {
+        return myData.values().reduce((all, i) => {
+            if (i.types?.includes('preset') && !i.types.includes('disabled')) {
+                all[i.id] = i;
+            }
+            return all;
+        }, {});
+    },
+    refresh: async () => {
+        //console.log('Loading item data');
+
+        try {
+            const results = await db.query(`
+                SELECT
+                    item_data.*,
+                    GROUP_CONCAT(DISTINCT types.type SEPARATOR ',') AS types
+                FROM
+                    item_data
+                LEFT JOIN types ON
+                    types.item_id = item_data.id
+                GROUP BY
+                    item_data.id
+            `).then(rows => {
+                return rows;
+            });
+
+            const currentItems = new Map();
+
+            const gameModeFields = [
+                'lastOfferCount',
+                'lastScan',
+            ];
+
+            for (const result of results) {
+                Reflect.deleteProperty(result, 'item_id');
+                Reflect.deleteProperty(result, 'base_price');
+
+                const preparedData = {
+                    ...result,
+                    types: result.types?.split(',') || [],
+                    updated: result.last_update,
+                    lastLowPrice: null,
+                    avg24hPrice: null,
+                    high24hPrice: null,
+                    changeLast48h: null,
+                    changeLast48hPercent: null,
+                    lastLowPricePve: null,
+                    avg24hPricePve: null,
+                    high24hPricePve: null,
+                    pve_changeLast48h: null,
+                    pve_changeLast48hPercent: null,
+                    lastOfferCount: result.last_offer_count,
+                    //pve_lastOfferCount: result.pve_last_offer_count,
+                    //'pvp-season_lastOfferCount': result['pvp-season_last_offer_count'],
+                    lastScan: result.last_scan,
+                    //pve_lastScan: result.pve_last_scan,
+                    //'pvp-season_lastScan': result['pvp-season_last_scan'],
+                };
+                for (const gameModeField of gameModeFields) {
+                    for (const gameMode of gameModes) {
+                        if (gameMode.name === 'regular') {
+                            continue;
+                        }
+                        preparedData[`${gameMode.name}_${gameModeField}`] = result[`${gameMode.name}_${camelCaseToSnakeCase(gameModeField)}`];
+                    }
+                }
+                preparedData.properties ??= {};
+                currentItems.set(result.id, preparedData);
+                myData.set(result.id, preparedData);
+            }
+
+            for (const id of myData.keys()) {
+                if (!currentItems.has(id)) {
+                    myData.delete(id);
+                }
+            }
+
+            lastRefresh = new Date();
+            emitter.emit('dbItemsUpdated', myData);
+            return myData;
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    },
+    getWithPrices: async (refreshItems = false, logger = console) => {
+        logger.log('Loading price data');
+
+        try {
+            const itemsPromise = methods.get(refreshItems);
+            
+            logger.time('item-24h-price-query');
+            const price24hPromise = db.batchQuery(`
+                SELECT
+                    price,
+                    item_id,
+                    game_mode
+                FROM
+                    price_data
+                WHERE
+                    timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)
+            `).finally(() => {
+                logger.timeEnd('item-24h-price-query');
+            });
+
+            logger.time('item-last-price-query');
+            const lastPricePromise = db.query(`
+                SELECT
+                    a.item_id,
+                    a.price_min as price,
+                    a.price_avg as avg,
+                    timestamp,
+                    a.game_mode
+                FROM
+                    price_historical a
+                INNER JOIN (
+                    SELECT
+                        MAX(timestamp) AS max_timestamp,
+                        item_id,
+                        game_mode
+                    FROM 
+                        price_historical
+                    GROUP BY
+                        item_id, game_mode
+                ) b
+                ON
+                    a.item_id = b.item_id AND a.timestamp = b.max_timestamp AND a.game_mode = b.game_mode
+            `).finally(() => {
+                logger.timeEnd('item-last-price-query');
+            });
+
+            logger.time('price-yesterday-query');
+            const avgPriceYesterdayPromise = db.query(`
+                SELECT
+                    avg(price) AS priceYesterday,
+                    item_id,
+                    game_mode
+                FROM
+                    price_data
+                WHERE
+                    timestamp > DATE_SUB(NOW(), INTERVAL 2 DAY)
+                AND
+                    timestamp < DATE_SUB(NOW(), INTERVAL 1 DAY)
+                GROUP BY
+                    item_id, game_mode
+            `).then(results => results.reduce((all, resultRow) => {
+                all[resultRow.game_mode] ??= {};
+                all[resultRow.game_mode][resultRow.item_id] = resultRow.priceYesterday;
+                return all;
+            }, {})).finally(() => {
+                logger.timeEnd('price-yesterday-query');
+            });
+
+            logger.time('item-24h-price-historical-query');
+            const priceHistorical24hPromise = db.query(`
+                SELECT
+                    item_id,
+                    price_min,
+                    price_avg,
+                    game_mode
+                FROM
+                    price_historical
+                WHERE
+                    timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)
+            `).then(results => results.reduce((all, resultRow) => {
+                all[resultRow.game_mode] ??= {};
+                all[resultRow.game_mode][resultRow.item_id] ??= {
+                    min: [],
+                    avg: [],
+                };
+                all[resultRow.game_mode][resultRow.item_id].min.push(resultRow.price_min);
+                all[resultRow.game_mode][resultRow.item_id].avg.push(resultRow.price_avg);
+                return all;
+            }, {})).finally(() => {
+                logger.timeEnd('item-24h-price-historical-query');
+            });
+
+            logger.time('price-yesterday-historical-query');
+            const avgPriceHistoricalYesterdayPromise = db.query(`
+                SELECT
+                    avg(price_avg) AS priceYesterday,
+                    item_id,
+                    game_mode
+                FROM
+                    price_historical
+                WHERE
+                    timestamp > DATE_SUB(NOW(), INTERVAL 2 DAY)
+                AND
+                    timestamp < DATE_SUB(NOW(), INTERVAL 1 DAY)
+                GROUP BY
+                    item_id, game_mode
+            `).then(results => results.reduce((all, resultRow) => {
+                all[resultRow.game_mode] ??= {};
+                all[resultRow.game_mode][resultRow.item_id] = resultRow.priceYesterday;
+                return all;
+            }, {})).finally(() => {
+                logger.timeEnd('price-yesterday-historical-query');
+            });
+
+            const [
+                items,
+                price24hResults,
+                lastPriceResults,
+                avgPriceYesterday,
+                item24hPricesHistorical,
+                avgPriceHistoricalYesterday,
+            ] = await Promise.all([
+                itemsPromise,
+                price24hPromise,
+                lastPricePromise,
+                avgPriceYesterdayPromise,
+                priceHistorical24hPromise,
+                avgPriceHistoricalYesterdayPromise,
+            ]);
+
+            const item24hPrices = price24hResults.reduce((all, resultRow) => {
+                if (!all[resultRow.game_mode]) {
+                    all[resultRow.game_mode] = {};
+                }
+                if (!all[resultRow.game_mode][resultRow.item_id]) {
+                    all[resultRow.game_mode][resultRow.item_id] = [];
+                }
+                all[resultRow.game_mode][resultRow.item_id].push(resultRow.price);
+                return all;
+            }, {});
+
+            const itemLastPrices = lastPriceResults.reduce((all, current) => {
+                if (!all[current.game_mode]) {
+                    all[current.game_mode] = {};
+                }
+                all[current.game_mode][current.item_id] = current;
+                return all;
+            }, {});
+
+            for (const [itemId, item] of items) {
+                item.updated = item.last_update;
+                if (item.types.includes('no-flea')) {    
+                    continue;
+                }
+
+                for (const gameMode of gameModes) {
+                    const fieldPrefix = gameMode.name === 'regular' ? '' : `${gameMode.name}_`;
+
+                    //const lastLowData = lastLowPriceResults.find(row => row.item_id === itemId && row.game_mode === gameMode.value);
+                    const lastData = itemLastPrices[gameMode.value]?.[itemId];
+                    if (lastData) {
+                        item[`${fieldPrefix}lastLowPrice`] = lastData.price;
+                        item[`${fieldPrefix}lastScan`] = lastData.timestamp;
+                    }
+
+                    let item24hPriceMin = item24hPrices[gameMode.value]?.[itemId];
+                    let item24hPriceAvg = item24hPriceMin;
+                    if (!item24hPriceMin) {
+                        item24hPriceMin = item24hPricesHistorical[gameMode.value]?.[itemId]?.min ?? [];
+                        item24hPriceAvg = item24hPricesHistorical[gameMode.value]?.[itemId]?.avg ?? [];
+                    }
+                    item24hPriceMin.sort((a, b) => a - b);
+                    
+                    item[`${fieldPrefix}avg24hPrice`] = getInterquartileMean(item24hPriceAvg) || lastData?.avg || null;
+                    item[`${fieldPrefix}low24hPrice`] = item24hPriceMin.at(0);
+                    item[`${fieldPrefix}high24hPrice`] = item24hPriceAvg.at(item24hPriceAvg.length - 1);
+    
+                    const itemPriceYesterday = avgPriceYesterday[gameMode.value]?.[itemId] ?? avgPriceHistoricalYesterday[gameMode.value]?.[itemId];
+                    if (!itemPriceYesterday || item[`${fieldPrefix}avg24hPrice`] === 0) {
+                        item[`${fieldPrefix}changeLast48h`] = 0;
+                        item[`${fieldPrefix}changeLast48hPercent`] = 0;
+                    } else {
+                        item[`${fieldPrefix}changeLast48h`] = Math.round(item[`${fieldPrefix}avg24hPrice`] - itemPriceYesterday);
+                        const percentOfDayBefore = item[`${fieldPrefix}avg24hPrice`] / itemPriceYesterday;
+                        item[`${fieldPrefix}changeLast48hPercent`] = Math.round((percentOfDayBefore - 1) * 100 * 100) / 100;
+                    }
+                }
+            }
+            return items;
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    },
+    updateTypes: async updateObject => {
+        await methods.get();
+        const currentItemData = myData.get(updateObject.id);
+
+        if(updateObject.active === false && !currentItemData.types.includes(updateObject.type)){
+            return true;
+        }
+
+        if(updateObject.active === false){
+            currentItemData.types.splice(currentItemData.types.indexOf(updateObject.type), 1);
+            methods.removeType(updateObject.id, updateObject.type);
+        }
+
+        if(updateObject.active === true){
+            currentItemData.types.push(updateObject.type);
+            methods.addType(updateObject.id, updateObject.type);
+        }
+
+        myData.set(updateObject.id, currentItemData);
+    },
+    addType: async (id, type) => {
+        console.log(`Adding ${type} for ${id}`);
+        const [itemData, insertResult] = await Promise.all([
+            methods.get(),
+            db.query(`INSERT IGNORE INTO types (item_id, type) VALUES (?, ?)`, [id, type]),
+        ]);
+        const item = myData.get(id);
+        if (item && !item.types.includes(type)) {
+            item.types.push(type);
+        }
+        return insertResult;
+    },
+    addTypes: async (id, itemTypes) => {
+        const queryvalues = [];
+        for (const t of itemTypes) {
+            queryvalues.push(id, t);
+        }
+        const [itemData, insertResult] = await Promise.all([
+            methods.get(),
+            db.query(`INSERT IGNORE INTO types (item_id, type) VALUES ${itemTypes.map(() => '(?, ?)').join(', ')}`, queryvalues),
+        ]);
+        const item = myData.get(id);
+        for (const type of itemTypes) {
+            if (item && !item.types.includes(type)) {
+                item.types.push(type);
+            }
+        }
+        return insertResult;
+    },
+    removeType: async (id, type) => {
+        //console.log(`Removing ${type} for ${id}`);
+        const [itemData, deleteResult] = await Promise.all([
+            methods.get(),
+            db.query(`DELETE FROM types WHERE item_id = ? AND type= ?`, [id, type])
+        ]);
+        const item = myData.get(id);
+        if (item) {
+            item.types = item.types.filter(t => t !== type);
+        }
+        return deleteResult;
+    },
+    setProperty: async (id, property, value) => {
+        const currentItemData = myData.get(id);
+        if (currentItemData[property] === value) {
+            return false;
+        }
+        console.log(`Setting ${property} to ${value} for ${id}`);
+        currentItemData[property] = value;
+        return db.query(`UPDATE item_data SET ${property} = ? WHERE id = ?`, [value, id]);
+    },
+    setProperties: async (id, properties) => {
+        const currentItemData = myData.get(id);
+        const changeValues = {};
+        for (const property in properties) {
+            if (property === 'id') {
+                continue;
+            }
+            if (property === 'types') {
+                console.log('Cannot set types via setProperties');
+                continue;
+            }
+            let value = properties[property];
+            let currentValue = currentItemData[property];
+            if (property === 'properties') {
+                currentValue = JSON.stringify(currentValue);
+                value = JSON.stringify(value);
+            }
+            if (currentValue !== value) {
+                changeValues[property] = value;
+                if (property === 'name' && !properties.normalized_name) {
+                    changeValues.normalized_name = normalizeName(value);
+                }
+            }
+        }
+        if (Object.keys(changeValues).length === 0) {
+            return;
+        }
+        console.log(`Setting ${currentItemData.name} ${id} properties to`, changeValues);
+        const fieldNames = [];
+        const placeHolderValues = [];
+        for (const property in changeValues) {
+            fieldNames.push(`${property} = ?`);
+            placeHolderValues.push(changeValues[property])
+        }
+        placeHolderValues.push(id);
+        return db.query(`UPDATE item_data SET ${fieldNames.join(', ')} WHERE id = ?`, placeHolderValues).then(result => {
+            for (const property in changeValues) {
+                if (property === 'properties') {
+                    currentItemData[property] = properties[property];
+                } else {
+                    currentItemData[property] = changeValues[property];
+                }
+            }
+            return result;
+        });
+    },
+    addItem: async (values) => {
+        if (!values.id) {
+            return Promise.reject(new Error('You must provide id to add an item'));
+        }
+        await methods.get();
+        const insertFields = [];
+        const insertValues = [];
+        const updateFields = [];
+        const updateValues = [];
+        for (const property in values) {
+            if (property === 'types') {
+                continue;
+            }
+            let value = values[property];
+            if (property === 'properties') {
+                value = JSON.stringify(value);
+            }
+            insertFields.push(property);
+            insertValues.push(value);
+            if (property !== 'id') {
+                updateFields.push(`${property}=?`);
+                updateValues.push(value);
+            }
+        }
+        const insertResult = await db.query(`
+            INSERT INTO 
+                item_data (${insertFields.join(', ')})
+            VALUES (
+                ${insertValues.map(() => '?')}
+            )
+            ON DUPLICATE KEY UPDATE
+                ${updateFields.join(', ')}
+        `, [...insertValues, ...updateValues]);
+        //console.log('insertResult', insertResult);
+        if (insertResult.affectedRows > 0) {
+            const currentItemData = myData.get(values.id) ?? {types: []};
+            const newTypes = values.types ?? [];
+            delete values.types;
+            myData.set(values.id, {
+                ...currentItemData,
+                ...values,
+                updated: currentItemData?.updated ?? new Date(),
+            });
+            if (newTypes.length) {
+                await methods.addTypes(values.id, newTypes);
+            }
+            emitter.emit('itemAdded', myData.get(values.id));
+        }
+        return insertResult;
+    },
+    removeItem: async (id) => {
+        if (!id) {
+            return Promise.reject(new Error('You must provide id to remove an item'));
+        }
+        await methods.get();
+        if (!myData.has(id)) {
+            return Promise.reject(new Error(`Item ${id} not found`));
+        }
+        const [result, typesResult, imageResult] = await Promise.all([
+            db.query('DELETE FROM item_data WHERE id = ?', [id]),
+            db.query('DELETE FROM types WHERE item_id = ?', [id]),
+            removeItemImages(myData.get(id)),
+        ]);
+        emitter.emit('itemRemoved', myData.get(id));
+        myData.delete(id);
+        return result;
+    },
+    hasPrices: async (id) => {
+        const fleaPrice = await db.query('select count(id) as num from price_data where item_id = ?', [id]);
+        if (fleaPrice[0].num !== 0) {
+            return true;
+        }
+        const priceArchive = await db.query('select count(item_id) as num from price_archive where item_id = ?', [id]);
+        if (priceArchive[0].num !== 0) {
+            return true;
+        }
+        const traderOffer = await db.query('select count(id) as num from trader_offers where item_id = ?', [id]);
+        return traderOffer[0].num !== 0;
+    },
+    dogtagIds: () => {
+        const dogtagPreset = [...myData.values()].find(i => i.properties?.items?.some(i => i._tpl === dogtags.ids.bear));
+        return {
+            bear: dogtags.ids.bear,
+            usec: dogtags.ids.usec,
+            any: dogtagPreset.id,
+        };
+    },
+    isDogtag: (id) => {
+        return Object.values(methods.dogtagIds()).includes(id);
+    },
+    priceFields: () => {
+        return [
+            'lastLowPrice',
+            'avg24hPrice',
+            'low24hPrice',
+            'high24hPrice',
+            'changeLast48h',
+            'changeLast48hPercent',
+            'lastOfferCount',
+            'lastScan',
+        ];
+    },
+    on: (event, listener) => {
+        return emitter.on(event, listener);
+    },
+    off: (event, listener) => {
+        return emitter.off(event, listener);
+    },
+    once: (event, listener) => {
+        return emitter.once(event, listener);
+    },
+};
+
+export default methods;

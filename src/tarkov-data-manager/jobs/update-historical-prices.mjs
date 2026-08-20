@@ -1,0 +1,123 @@
+import fs from 'node:fs/promises';
+import  path from 'node:path';
+
+import DataJob from '../modules/data-job.mjs';
+
+const historicalPriceDays = 30;
+
+class UpdateHistoricalPricesJob extends DataJob {
+    constructor(options) {
+        super({...options, name: 'update-historical-prices'});
+        this.kvName = 'historical_price_data';
+        this.idSuffixLength = 1;
+        this.apiType = 'historicalPricePoint';
+    }
+
+    async run() {
+        this.kvData = {};
+        const priceWindow = new Date(new Date().setDate(new Date().getDate() - historicalPriceDays));
+        for (const gameMode of this.gameModes) {
+            this.kvData[gameMode.name] = {};
+            let kvName = this.kvName;
+            if (gameMode.name !== 'regular') {
+                kvName += `_${gameMode.name}`;
+            }
+            const itemPriceData = await fs.readFile(path.join(import.meta.dirname, '..', 'dumps', `${kvName}.json`)).then(buffer => {
+                return JSON.parse(buffer)[this.apiType];
+            }).catch(error => {
+                if (error.code !== 'ENOENT') {
+                    console.log(error);
+                }
+                this.logger.log(`Generating full ${gameMode.name} historical prices`);
+                return {};
+            });
+            this.archivedPrices = await this.jobOutput('update-archived-prices', {gameMode: gameMode.name})
+    
+            // filter previously-processed prices to be within the window
+            // also change the cutoff for new prices to be after the oldest price we already have
+            let dateCutoff = priceWindow;
+            let totalExistingPrices = 0;
+            for (const itemId in itemPriceData) {
+                itemPriceData[itemId] = itemPriceData[itemId].filter(oldPrice => {
+                    if (oldPrice.timestamp > dateCutoff.getTime()) {
+                        dateCutoff = new Date(oldPrice.timestamp);
+                    }
+                    return oldPrice.timestamp > priceWindow.getTime();
+                });
+                totalExistingPrices += itemPriceData[itemId].length;
+            }
+            if (totalExistingPrices > 0) {
+                this.logger.log(`Found ${totalExistingPrices.toLocaleString()} ${gameMode.name} prices from ${priceWindow} to ${dateCutoff}`);
+            }
+            this.logger.log(`Getting ${gameMode.name} prices after ${dateCutoff}`);
+    
+            this.logger.time('historical-prices-query');
+            const historicalPriceData = await this.batchQuery(`
+                SELECT
+                    item_id, timestamp, price_min, price_avg, offer_count
+                FROM
+                    price_historical
+                WHERE
+                    timestamp > ? AND
+                    game_mode = ?
+                ORDER BY timestamp, item_id
+            `, [dateCutoff, gameMode.value], (batchResult, offset) => {
+                if (batchResult.length === 0 && offset === 0) {
+                    this.logger.log(`Retrieved no ${gameMode.name} prices`);
+                } else {
+                    this.logger.log(`Retrieved ${offset + batchResult.length} ${gameMode.name} prices through ${batchResult[batchResult.length-1].timestamp}${batchResult.length === this.maxQueryRows ? '...' : ''}`);
+                }
+            });
+            this.logger.timeEnd('historical-prices-query');
+    
+            for (const row of historicalPriceData) {
+                if (!itemPriceData[row.item_id]) {
+                    itemPriceData[row.item_id] = [];
+                }
+                itemPriceData[row.item_id].push({
+                    priceMin: row.price_min,
+                    price: Math.round(row.price_avg),
+                    offerCount: row.offer_count,
+                    timestamp: row.timestamp.getTime(),
+                });
+            }
+    
+            this.kvData[gameMode.name][this.apiType] = itemPriceData;
+            await this.cloudflarePut(this.kvData[gameMode.name], this.kvName, gameMode.name);
+            await this.updateStaticApi(this.kvData[gameMode.name], gameMode.name).catch(error => {
+                this.logger.error(`Error updating JSON API: ${error}`);
+            });
+            this.logger.log(`Uploaded ${gameMode.name} historical prices`);
+        }
+        this.logger.success('Done with historical prices');
+        return this.kvData;
+    }
+
+    async updateStaticApi(data, gameMode) {
+        const itemIds = [...new Set([...Object.keys(data.historicalPricePoint), ...Object.keys(this.archivedPrices)])];
+        const puts = [];
+        const purgeUrls = [];
+        for (const id of itemIds) {
+            puts.push(this.r2Put(`${gameMode}/prices/${id}`, {
+                data: [
+                    ...this.archivedPrices[id] ?? [],
+                    ...data.historicalPricePoint[id] ?? [],
+                ],
+                translations: []
+            }, {skipPurge: true}).then(url => {
+                if (!url) {
+                    return;
+                }
+                purgeUrls.push(url);
+            }));
+            if (puts.length >= 100) {
+                await Promise.all(puts);
+                puts.length = 0;
+            }
+        }
+        await Promise.all(puts);
+        await this.purgeCachePrefix(purgeUrls);
+    }
+}
+
+export default UpdateHistoricalPricesJob;

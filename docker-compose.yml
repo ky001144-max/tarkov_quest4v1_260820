@@ -1,0 +1,51 @@
+# To build the entire stack run 'make run'
+# this is the base docker-compose file
+
+services:
+  tarkov_data_manager:
+    container_name: tarkov_data_manager
+    restart: unless-stopped
+    build:
+      context: ./src/tarkov-data-manager
+      dockerfile: ./Dockerfile
+    env_file: 
+      - ./src/tarkov-data-manager/config.env
+      - ./src/tarkov-data-manager/creds.env
+    volumes:
+      - ./src/tarkov-data-manager/settings:/app/settings
+      - ./src/tarkov-data-manager/cache:/app/cache
+      - ./src/tarkov-data-manager/logs:/app/logs
+      - ./src/tarkov-data-manager/dumps:/app/dumps
+      - ./src/tarkov-data-manager/node-logs:/home/node/.npm/_logs
+    depends_on:
+      - database
+
+  database:
+    build:
+      context: ./src/db
+      dockerfile: ./Dockerfile
+    restart: unless-stopped
+    command: --default-authentication-plugin=caching_sha2_password --require_secure_transport=ON
+    environment:
+      MYSQL_DATABASE: tarkov
+      MYSQL_SSL_CERT: /etc/mysql/certs/server-cert.pem
+      MYSQL_SSL_KEY: /etc/mysql/certs/server-key.pem
+      TZ: UTC # force UTC timezone
+    ports:
+      - 3306:3306
+
+  backup:
+    build:
+      context: ./src/backup
+      dockerfile: ./Dockerfile
+    restart: unless-stopped
+    env_file: 
+      - ./src/backup/config.env
+    depends_on:
+      - database
+
+volumes:
+  settings:
+  cache:
+  logs:
+  dumps:

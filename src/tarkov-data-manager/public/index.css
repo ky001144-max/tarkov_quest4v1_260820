@@ -1,0 +1,45 @@
+.image-column img {
+    max-width: 100%;
+}
+
+.item-image img {
+    max-width: 100%;
+}
+
+pre {
+    resize: both;
+    overflow: auto;
+    height: 100px;
+    width: 100px;
+}
+
+.log-messages {
+    color: #fff;
+    background-color: #000;
+    font-family: monospace;
+    height: 200px;
+    overflow: hidden scroll;
+    padding-left: 15px;
+}
+
+.container {
+    margin-top: 3px;
+    margin-bottom: 3px;
+}
+
+.scanner-header {
+    vertical-align: middle;
+}
+
+.preset-name-button {
+    margin-top: 2px;
+    margin-bottom: 2px;
+}
+
+.no-wrap {
+    white-space: pre;
+}
+
+.displayNone {
+    display: none;
+}

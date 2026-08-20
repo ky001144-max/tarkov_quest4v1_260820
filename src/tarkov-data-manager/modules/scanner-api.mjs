@@ -1,0 +1,1413 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import imgGen from 'tarkov-dev-image-generator';
+
+import remoteData from './remote-data.mjs';
+import { query } from './db-connection.mjs';
+import { dashToCamelCase } from './string-functions.mjs';
+import { uploadToS3 } from './upload-s3.mjs';
+import { createAndUploadFromSource } from './image-create.mjs';
+import presetData from './preset-data.mjs';
+import emitter from './emitter.mjs';
+import gameModes from './game-modes.mjs';
+import tarkovDevData from './tarkov-data-tarkov-dev.mjs';
+
+const { imageSizes } = imgGen.imageFunctions;
+
+let users;
+let usersUpdating = false;
+let presets = {};
+let presetsByBase = {};
+const replicas = {};
+const activeTraderScans = {};
+
+export const userFlags = {
+    disabled: 0,
+    insertPlayerPrices: 1,
+    insertTraderPrices: 2,
+    trustTraderUnlocks: 4,
+    skipPriceInsert: 8,
+    jsonDownload: 16,
+    overwriteImages: 32,
+    submitData: 64,
+};
+
+export const scannerFlags = {
+    none: 0,
+    ignoreMissingScans: 1,
+    skipPriceInsert: 2
+};
+
+const updatePresets = (newPresets) => {
+    try {
+        presets = newPresets;
+        presetsByBase = Object.values(newPresets).reduce((all, p) => {
+            if (!all[p.properties.items[0]._tpl]) {
+                all[p.properties.items[0]._tpl] = [];
+            }
+            all[p.properties.items[0]._tpl].push(p);
+            return all;
+        }, {});
+    } catch (error) {
+        console.log('ScannerAPI error updating presets:', error.message);
+    }
+};
+
+emitter.on('presetsUpdated', updatePresets);
+await remoteData.get();
+updatePresets(remoteData.getPresets());
+
+const addReplica = (replica) => {
+    if (!replicas[item.properties.source]) {
+        replicas[item.properties.source] = [];
+    }
+    if (replicas[item.properties.source].some(i => i.id === replica.id)) {
+        return;
+    }
+    replicas[item.properties.source].push(replica);
+};
+
+const removeReplica = (replica) => {
+    if (!replicas[item.properties.source]) {
+        return;
+    }
+    replicas[item.properties.source] = replicas[item.properties.source].filter(r => r.id !== replica.id);
+};
+
+remoteData.on('dbItemsLoaded', items => {
+    for (const item of items.values()) {
+        if (item.types.includes('replica') && item.properties.source) {
+            addReplica(item);
+        }
+    }
+});
+
+remoteData.on('itemAdded', item => {
+    if (item.types.includes('replica') && item.properties.source) {
+        addReplica(item);
+    }
+});
+
+remoteData.on('itemRemoved', item => {
+    if (item.types.includes('replica') && item.properties.source) {
+        removeReplica(item);
+    }
+});
+
+const refreshTraderScanStatus = async () => {
+    const activeScans = await query('SELECT * from trader_offer_scan WHERE ended IS NULL');
+    for (const gameMode of gameModes) {
+        const gameModeTraderScan = activeScans.find(s => s.game_mode === gameMode.value);
+        activeTraderScans[gameMode.name] = gameModeTraderScan ?? false;
+    }
+    return activeTraderScans;
+};
+
+const queryResultToBatchItem = item => {
+    return {
+        id: item.id,
+        name: String(item.name),
+        shortName: String(item.short_name),
+        types: item.types?.split(',').map(dashCase => dashToCamelCase(dashCase)) ?? [],
+        backgroundColor: item.properties?.backgroundColor ?? 'default',
+        width: item.width ? item.width : 1,
+        height: item.height ? item.height : 1,
+        items: [],
+        matchIndex: item.match_index,
+        needsBaseImage: !!item.needs_base_image,
+        needsImage: !!item.needs_image,
+        needsGridImage: !!item.needs_grid_image,
+        needsIconImage: !!item.needs_icon_image,
+        needs512pxImage: !!item.needs_512px_image,
+        needs8xImage: !!item.needs_8x_image,
+        presets: presetsByBase[item.id]?.map(preset => {
+            return {
+                id: preset.id,
+                name: preset.name,
+                shortName: preset.short_name,
+                types: preset.types,
+                backgroundColor: preset.properties.backgroundColor,
+                width: preset.width,
+                height: preset.height,
+                default: preset.properties.default,
+                items: preset.items,
+            }
+        }) ?? [],
+        replicas: replicas[item.id]?.map(replica => {
+            return {
+                id: replica.id,
+                name: replica.name,
+                shortName: replica.short_name,
+                types: replica.types,
+                backgroundColor: replica.backgroundColor,
+                width: replica.width,
+                height: replica,height,
+                source: replica.properties.source,
+                filters: replica.properties.filters,
+            };
+        }) ?? [],
+    };
+};
+
+const endTraderScan = async (gameModeName) => {
+    let prefix = '';
+    if (gameModeName !== 'regular') {
+        prefix = `${gameModeName}_`;
+    }
+    const gameMode = gameModes.find(gm => gm.name === gameModeName) ?? gameModes.find(gm => gm.name === 'regular');
+
+    const checkout = await query(`SELECT COUNT(id) checkout_count FROM item_data WHERE ${prefix}trader_checkout_scanner_id IS NOT NULL`);
+    if (checkout[0].checkount_count > 0) {
+        return {
+            data: `unable to end incomplete ${gameMode.name} trader scan`,
+        };
+    }
+    const activeScan = await query('SELECT * from trader_offer_scan WHERE ended IS NULL AND game_mode = ?', [gameMode.value]);
+    if (activeScan.length < 1) {
+        return {
+            data: `no active ${gameMode.name} trader scan`,
+        };
+    }
+    const stopResult = await query('UPDATE trader_offer_scan SET ended=now() WHERE id=?', [activeScan[0].id]);
+    if (stopResult.affectedRows < 1) {
+        return {
+            data: `unable to update active ${gameMode.name} trader scan`,
+        }
+    }
+    activeTraderScans[gameMode.name] = false;
+    emitter.emit('traderScanEnded', activeScan);
+    const anyScanActive = Object.values(activeTraderScans).some(scan => !!scan);
+    if (!anyScanActive) {
+        emitter.emit('traderScansEnded');
+    }
+    return {
+        data: 'Trader scan ended',
+    }
+};
+
+const getScannerId = async (options, createMissing) => {
+    const scanner = await scannerApi.getScanner(options, createMissing);
+    return scanner.id;
+};
+
+const scannerApi = {
+    createScanner: async (user, scannerName) => {
+        if (!(userFlags.insertPlayerPrices & user.flags) && !(userFlags.insertTraderPrices & user.flags)) {
+            throw new Error('User not authorized to insert prices');
+        }
+        if (user.scanners.length >= user.max_scanners) {
+            throw new Error(`Could not find scanner with name ${scannerName} and user already at maximum scanners (${user.max_scanners})`);
+        }
+        if (scannerName.match(/[^a-zA-Z0-9_-]/g)) {
+            throw new Error('Scanner names can only contain letters, numbers, dashes (-) and underscores (_)');
+        }
+        try {
+            const result = await query('INSERT INTO scanner (scanner_user_id, name) VALUES (?, ?)', [user.id, scannerName]);
+            const newScanner = {id: result.insertId, name: scannerName, scanner_user_id: user.id, flags: 0};
+            user.scanners.push(newScanner);
+            return newScanner;
+        } catch (error) {
+            if (error.toString().includes('Duplicate entry')) {
+                throw new Error(`Scanner ${scannerName} already exists`);
+            }
+            throw error;
+        }
+    },
+    deleteScanner: async (options) => {
+        const response = {errors: [], warnings: [], data: {}};
+        // check if scanner has records in price_data, trader_items, trader_price_data before deleting
+        try {
+            let deleteScannerName = options.deleteScannerName;
+            if (!deleteScannerName) {
+                deleteScannerName = options.scannerName;
+            }
+            const scannerId = await getScannerId({user: options.user, scannerName: deleteScannerName}, false);
+            const result = await query(`
+                SELECT scanner.id, COALESCE(price_count, 0) as price_count, COALESCE(trader_offer_count, 0) as trader_offer_count, COALESCE(trader_price_count, 0) as trader_price_count
+                FROM scanner
+                LEFT JOIN (
+                    SELECT scanner_id, COUNT(id) as price_count
+                    FROM price_data
+                    WHERE scanner_id=?
+                    GROUP BY scanner_id
+                ) prices ON scanner.id = prices.scanner_id
+                LEFT JOIN (
+                    SELECT scanner_id, COUNT(id) as trader_offer_count
+                    FROM trader_items
+                    WHERE scanner_id=?
+                    GROUP BY scanner_id
+                ) offers ON scanner.id = offers.scanner_id
+                LEFT JOIN (
+                    SELECT scanner_id, COUNT(id) as trader_price_count
+                    FROM trader_price_data
+                    WHERE scanner_id=?
+                    GROUP BY scanner_id
+                ) trader_prices ON scanner.id = trader_prices.scanner_id
+                WHERE scanner.id=?
+            `, [scannerId, scannerId, scannerId, scannerId]);
+            if (result.price_count > 0 || result.trader_offer_count > 0 || result.trader_price_count > 0) {
+                throw new Error('Cannot delete scanner with linked prices or trader offers.');
+            }
+            await query('DELETE FROM scanner WHERE id=?', [scannerId]);
+            options.user.scanners = options.user.scanners.filter(scanner => {
+                return scanner.id != scannerId;
+            });
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+        return response;
+    },
+    renameScanner: async (options) => {
+        const response = {errors: [], warnings: [], data: {}};
+        try {
+            let oldScannerName = options.scannerName;
+            if (options.oldScannerName) {
+                oldScannerName = options.oldScannerName;
+            }
+            const scannerId = await getScannerId({user: options.user, scannerName: oldScannerName}, false);
+            if (options.newScannerName === oldScannerName) {
+                throw new Error('newScannerName matches existing scanner name');
+            }
+            if (!options.newScannerName) {
+                throw new Error('newScannerName cannot be blank');
+            }
+            if (options.newScannerName.match(/[^a-zA-Z0-9_-]/g)) {
+                throw new Error('Scanner names can only contain letters, numbers, dashes (-) and underscores (_)');
+            }
+            await query(
+                'UPDATE scanner SET name=? WHERE id=?', 
+                [options.newScannerName, scannerId]
+            );
+            options.user.scanners.forEach(scanner => {
+                if (scanner.id === scannerId) {
+                    scanner.name = options.newScannerName;
+                }
+            });
+            response.data = 'ok';
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+        return response;
+    },
+    getScanner: async (options, createMissing) => {
+        for (const scanner of options.user.scanners) {
+            if (scanner.name === options.scannerName) {
+                return scanner;
+            }
+        }
+        if (!createMissing) {
+            throw new Error(`Scanner with name ${options.scannerName} not found`);
+        }
+        return scannerApi.createScanner(options.user, options.scannerName);
+    },
+    setScannerFlags: async (id, flags) => {
+        await query('UPDATE scanner SET flags=? WHERE id=?', [flags, id]);
+    },
+    getUsers: async () => {
+        if (usersUpdating) {
+            await new Promise(resolve => {
+                emitter.once('usersUpdated', resolve);
+            });
+        }
+        if (!users) {
+            await scannerApi.refreshUsers();
+        }
+        return users;
+    },
+    getUser: async (id) => {
+        const userCheck = await query('SELECT * from scanner_user WHERE id=?', [id]);
+        if (userCheck.length === 0) {
+            return;
+        }
+        return userCheck[0];
+    },
+    getUserByName: async (username) => {
+        const userCheck = await query('SELECT * from scanner_user WHERE username=?', [username]);
+        if (userCheck.length === 0) {
+            return;
+        }
+        return userCheck[0];
+    },
+    addUser: async (username, password, disabled = 0) => {
+        disabled = disabled ? 1 : 0;
+        const sanitizedUsername = username.replace(/\n|\r/g, "");
+        console.log('inserting user', sanitizedUsername);
+        await query('INSERT INTO scanner_user (username, password, disabled) VALUES (?, ?, ?)', [sanitizedUsername, password, disabled])
+        await scannerApi.refreshUsers();
+    },
+    editUser: async (userId, updates) => {
+        const updateFields = [];
+        const updateValues = [];
+        for (const field in updates) {
+            updateFields.push(field);
+            updateValues.push(updates[field]);
+        }
+        if (updateFields.length > 0) {
+            await query(`UPDATE scanner_user SET ${updateFields.map(field => {
+                return `${field} = ?`;
+            }).join(', ')} WHERE id='${userId}'`, updateValues);
+            await scannerApi.refreshUsers();
+        }
+    },
+    deleteUser: async (username) => {
+        const deleteResult = await query('DELETE FROM scanner_user WHERE username=?', [username]);
+        if (deleteResult.affectedRows === 0) {
+            return false;
+        }
+        await scannerApi.refreshUsers();
+        return true;
+    },
+    setUserFlags: async (id, flags) => {
+        await query('UPDATE scanner_user SET flags=? WHERE id=?', [flags, id]);
+        await scannerApi.refreshUsers();
+    },
+    refreshUsers: async () => {
+        if (usersUpdating) {
+            return new Promise(resolve => {
+                emitter.once('usersUpdated', resolve);
+            });
+        }
+        usersUpdating = true;
+        users ??= {};
+        try {
+            const results = await query('SELECT * from scanner_user WHERE disabled=0');
+            const scannerQueries = [];
+            for (const username in users) {
+                const newestUser = results.find(r => r.username === username);
+                if (!newestUser) {
+                    users[username] = undefined;
+                    emitter.emit('userDisabled', username);
+                    continue;
+                }
+                if (users[username].flags && !newestUser.flags) {
+                    emitter.emit('userDisabled', username);
+                }
+            }
+            for (const user of results) {
+                const oldScanners = users[user.username]?.scanners || [];
+                user.scanners = oldScanners;
+                users[user.username] = user;
+                scannerQueries.push(query('SELECT * from scanner WHERE scanner_user_id = ?', [user.id]).then(scanners => {
+                    users[user.username].scanners = scanners;
+                }));
+            }
+            await Promise.all(scannerQueries);
+        } catch (error) {
+            console.error('Error refreshing users', error);
+        }
+        usersUpdating = false;
+    },
+    userFlags,
+    scannerFlags,
+    validateUser: async (username, password) => {
+        if (!username || !password) {
+            return false;
+        }
+        const usrs = await scannerApi.getUsers();
+        const user = usrs[username];
+        if (!user) {
+            return false;
+        }
+        if (user.password !== password) {
+            return false;
+        }
+        if (!user.flags) {
+            return false;
+        }
+        return true;
+    },
+    // getOptions sets defaults for various options used by API calls
+    // limitItem is a single item or array of items to specifically retrieve (generally for testing)
+    // imageOnly = true will retrieve only items missing images
+    // batchSize sets the number of items to retrieve at once
+    // offersFrom indicates whether the scanner is scanning player prices, trader prices, or both
+    // limitTrderScan = true ensures that a new batch of trader items to scan is only returned if there are some items
+    //      missing a trader scan within the past 24 hours
+    // trustTraderUnlocks = true means the information provided about trader minimum levels and quests will be used
+    //      to create missing trader offers.
+    // scanned is a toggle to indicate whether to set an item as scanned or release it
+    getOptions: async (options) => {
+        const defaultOptions = {
+            limitItem: false,
+            imageOnly: false,
+            batchSize: 50,
+            offersFrom: 2,
+            trustTraderUnlocks: false,
+            scanned: false,
+            offerCount: undefined,
+            sessionMode: 'regular',
+            fleaMarketAvailable: false,
+            pveFleaMarketAvailable: false,
+            pveModeAvailable: false,
+        }
+        const mergedOptions = {
+            ...defaultOptions,
+            ...options,
+        };
+        if (mergedOptions.batchSize > 200) {
+            mergedOptions.batchSize = 200;
+        }
+        if (mergedOptions.limitItem && typeof mergedOptions.limitItem === 'string') {
+            mergedOptions.limitItem = [mergedOptions.limitItem];
+        } else if (!mergedOptions.limitItem) {
+            mergedOptions.limitItem = false;
+        }
+        const offerMap = {
+            'any': 0,
+            'traders': 1,
+            'players': 2
+        }
+        if (typeof mergedOptions.offersFrom === 'string') {
+            if (offerMap[mergedOptions.offersFrom]) {
+                mergedOptions.offersFrom = offerMap[mergedOptions.offersFrom];
+            } else {
+                mergedOptions.offersFrom = 2;
+            }
+        }
+        if (typeof options.offersFrom === 'undefined') {
+            // if offersFrom isn't specified, it depends on if flea is available
+            mergedOptions.offersFrom = mergedOptions.fleaMarketAvailable || mergedOptions.pveFleaMarketAvailable ? 2 : 1;
+        }
+        if (typeof options.sessionMode === 'undefined') {
+            // if sessionMode isn't specified, it depends on if flea is available
+            // and if not, then if PVE is available
+            if (mergedOptions.pveFleaMarketAvailable) {
+                mergedOptions.sessionMode = 'pve';
+            } else if (mergedOptions.fleaMarketAvailable) {
+                mergedOptions.sessionMode = 'regular';
+            } else if (options.currentSessionMode) {
+                mergedOptions.sessionMode = options.currentSessionMode;
+            } else if (mergedOptions.pveModeAvailable) {
+                mergedOptions.sessionMode = 'pve'
+            }
+        }
+        /*if (mergedOptions.sessionMode === 'pve' && typeof options.offersFrom === 'undefined') {
+            // if in PVE mode and there's a trader scan, switch to trader scanning
+            mergedOptions.traderScanSession = await scannerApi.currentTraderScan();
+            if (mergedOptions.traderScanSession) {
+                mergedOptions.sessionMode = 'regular';
+                mergedOptions.offersFrom = 1;
+            }
+        }*/
+        if (typeof activeTraderScans[mergedOptions.sessionMode] === 'undefined') {
+            await refreshTraderScanStatus().catch(error => {
+                console.log('Error refreshing trader scan status:', error);
+            });
+        }
+        if (activeTraderScans[mergedOptions.sessionMode] && options.trustTraderUnlocks && !mergedOptions.limitItem && !mergedOptions.imageOnly) {
+            if (!activeTraderScans[mergedOptions.sessionMode].scanner_name && typeof options.offersFrom === 'undefined') {
+                await scannerApi.setTraderScanScanner(mergedOptions.sessionMode, options.scannerName).catch(error => {
+                    console.log('Error setting trader scan scanner:', error);
+                });
+                activeTraderScans[mergedOptions.sessionMode].scanner_name = options.scannerName;
+            }
+            if (activeTraderScans[mergedOptions.sessionMode].scanner_name === options.scannerName) {
+                mergedOptions.offersFrom = 1;
+            }
+        }
+        if (mergedOptions.offersFrom === 1 && typeof mergedOptions.traderScanSession === 'undefined') {
+            mergedOptions.traderScanSession = activeTraderScans[mergedOptions.sessionMode];
+        }
+        return mergedOptions;
+    },
+    /* on success, response.data.items is an array of items with the following format:
+    {
+        id: '57dc2fa62459775949412633',
+        name: 'Kalashnikov AKS-74U 5.45x39 assault rifle',
+        shortName: 'AKS-74U',
+        matchIndex: 0,
+        backgroundColor: 'black',
+        needsBaseImage: false,
+        needsImage: false,
+        needsGridImage: false,
+        needsIconImage: false,
+        needs512pxImage: false,
+        needs8xImage: false,
+        types: [ 'gun', 'wearable' ],
+        contains: [
+            {
+                _id: '61a9f9234e42d705e3133837',
+                _tpl: '57dc2fa62459775949412633',
+            },
+            {
+                _id: '61a9f9234e42d705e3133838',
+                _tpl: '57e3dba62459770f0c32322b',
+                parentId: '61a9f9234e42d705e3133837',
+                slotId: 'mod_pistol_grip'
+            },
+            ...
+        ]
+    } */
+    // relevant options: limitItem, imageOnly, batchSize, offersFrom
+    getItems: async (options) => {
+        const user = options.user;
+        const batchOptions = await scannerApi.getOptions(options);
+        const response = {errors: [], warnings: [], data: {
+            settings: {
+                offersFrom: batchOptions.offersFrom,
+                sessionMode: batchOptions.sessionMode,
+            },
+        }};
+        try {
+            if (batchOptions.limitItem) {
+                let itemIds = batchOptions.limitItem;
+                if (!Array.isArray(itemIds)) {
+                    itemIds = [itemIds];
+                }
+                response.data.items = await query(`
+                    SELECT
+                        item_data.id,
+                        name,
+                        short_name,
+                        match_index,
+                        width,
+                        height,
+                        properties,
+                        image_link IS NULL OR image_link = '' AS needs_image,
+                        base_image_link IS NULL OR base_image_link = '' as needs_base_image,
+                        grid_image_link IS NULL OR grid_image_link = '' AS needs_grid_image,
+                        icon_link IS NULL OR icon_link = '' AS needs_icon_image,
+                        image_512_link IS NULL or image_512_link = '' as needs_512px_image,
+                        image_8x_link IS NULL or image_8x_link = '' as needs_8x_image,
+                        GROUP_CONCAT(DISTINCT types.type SEPARATOR ',') AS types
+                    FROM
+                        item_data
+                    LEFT JOIN types ON
+                        types.item_id = item_data.id
+                    WHERE 
+                        item_data.id IN (${itemIds.map(() => '?').join(',')})
+                    GROUP BY
+                        item_data.id
+                `, itemIds).then(items => items.map(queryResultToBatchItem));
+                return response;
+            }
+            if (batchOptions.imageOnly) {
+                response.data.items = await query(`
+                    SELECT
+                        item_data.id,
+                        name,
+                        short_name,
+                        match_index,
+                        width,
+                        height,
+                        properties,
+                        image_link IS NULL OR image_link = '' AS needs_image,
+                        base_image_link IS NULL OR base_image_link = '' as needs_base_image,
+                        grid_image_link IS NULL OR grid_image_link = '' AS needs_grid_image,
+                        icon_link IS NULL OR icon_link = '' AS needs_icon_image,
+                        image_512_link IS NULL or image_512_link = '' as needs_512px_image,
+                        image_8x_link IS NULL or image_8x_link = '' as needs_8x_image,
+                        GROUP_CONCAT(DISTINCT types.type SEPARATOR ',') AS types
+                    FROM
+                        item_data
+                    LEFT JOIN types ON
+                        types.item_id = item_data.id
+                    WHERE NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'disabled') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'preset') AND 
+                        (item_data.image_link IS NULL OR item_data.image_link = '' OR 
+                        item_data.base_image_link IS NULL OR item_data.base_image_link = '' OR 
+                        item_data.grid_image_link IS NULL OR item_data.grid_image_link = '' OR 
+                        item_data.icon_link IS NULL OR item_data.icon_link = '' OR
+                        item_data.image_512_link IS NULL or item_data.image_512_link = '' OR 
+                        item_data.image_8x_link IS NULL or item_data.image_8x_link = '')
+                    GROUP BY item_data.id
+                    ORDER BY item_data.name
+                `).then(items => {
+                    return items.filter(item => Boolean(item.name)).map(queryResultToBatchItem);
+                });
+                return response;
+            }
+    
+            let prefix = '';
+            if (batchOptions.sessionMode === 'pve') {
+                prefix = 'pve_';
+            }
+            if (batchOptions.offersFrom === 1) {
+                prefix += 'trader_';
+            }
+            
+            if (batchOptions.offersFrom === 2 || batchOptions.offersFrom === 0) {
+                // if just players, exclude no-flea
+                let nofleaCondition = '';
+                if (batchOptions.offersFrom == 2) {
+                    nofleaCondition = 'AND NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = \'no-flea\')';
+                }
+                // player price checkout
+                // works if we include trader prices too
+                await query(`
+                    UPDATE item_data
+                    SET ${prefix}checkout_scanner_id = ?
+                    WHERE (${prefix}checkout_scanner_id IS NULL OR ${prefix}checkout_scanner_id = ?) AND
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'disabled') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'no-handbook') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'preset') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'replica') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'quest') ${nofleaCondition} 
+                    ORDER BY ${prefix}last_scan, id
+                    LIMIT ?
+                `, [batchOptions.scanner.id, batchOptions.scanner.id, batchOptions.batchSize]);
+            } else {
+                // trader-only price checkout
+                if (!batchOptions.traderScanSession) {
+                    response.data.items = [];
+                    return response;
+                }
+                await query(`
+                    UPDATE item_data
+                    SET ${prefix}checkout_scanner_id = ?
+                    WHERE ((${prefix}checkout_scanner_id IS NULL OR ${prefix}checkout_scanner_id = ?) AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'disabled') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'no-handbook') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'preset') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'replica') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'only-flea') AND 
+                        NOT EXISTS (SELECT type FROM types WHERE item_data.id = types.item_id AND type = 'quest') AND
+                        (${prefix}last_scan <= ? OR ${prefix}last_scan IS NULL) )
+                    ORDER BY ${prefix}last_scan, id
+                    LIMIT ?
+                `, [batchOptions.scanner.id, batchOptions.scanner.id, batchOptions.traderScanSession.started, batchOptions.batchSize]);
+            }
+            response.data.items = await query(`
+                SELECT
+                    item_data.id,
+                    name,
+                    short_name,
+                    match_index,
+                    properties,
+                    image_link IS NULL OR image_link = '' AS needs_image,
+                    base_image_link IS NULL OR base_image_link = '' as needs_base_image,
+                    grid_image_link IS NULL OR grid_image_link = '' AS needs_grid_image,
+                    icon_link IS NULL OR icon_link = '' AS needs_icon_image,
+                    image_512_link IS NULL or image_512_link = '' as needs_512px_image,
+                    image_8x_link IS NULL or image_8x_link = '' as needs_8x_image,
+                    GROUP_CONCAT(DISTINCT types.type SEPARATOR ',') AS types
+                FROM
+                    item_data
+                LEFT JOIN types ON
+                    types.item_id = item_data.id
+                WHERE
+                    item_data.${prefix}checkout_scanner_id = ?
+                GROUP BY item_data.id
+                ORDER BY item_data.${prefix}last_scan
+            `, [batchOptions.scanner.id]).then(items => {
+                return items.filter(item => Boolean(item.name)).map(queryResultToBatchItem);
+            });
+            if (response.data.items.length === 0) {
+                await endTraderScan(batchOptions.sessionMode);
+                if (options.fleaMarketAvailable || options.pveFleaMarketAvailable) {
+                    return scannerApi.getItems(options);
+                }
+            }
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+        if (userFlags.skipPriceInsert & user.flags || scannerFlags.skipPriceInsert & options.scanner.flags) {
+            scannerApi.releaseItem({...options, itemId: false, scanned: false});
+        }
+        return response;
+    },
+    //To set an item as scanned, include the attribtues offersFrom, scanned (true), and itemId 
+    // on success, response.data is the number of items set scanned (should be 1)
+
+    //To release a single item without setting as scanned, include the attribtues offersFrom, and itemId
+    // on success, response.data is the number of items released (probably 1)
+    // might be 0 if the item was already released for some reason
+
+    //To release all items, include the attribtue offersFrom
+    // on success, response.data is the number of items released
+    releaseItem: async (options) => {
+        const response = {errors: [], warnings: [], data: 0};
+        if (options.imageOnly) {
+            return response;
+        }
+        const itemId = options.itemId;
+        const itemScanned = options.scanned || typeof options.offerCount !== 'undefined';
+        const skipInsert = userFlags.skipPriceInsert & options.user.flags || scannerFlags.skipPriceInsert & options.scanner.flags;
+        const escapedValues = [];
+        let where = [];
+        let scanned = '';
+        let prefix = '';
+        let setLastScan = false;
+        if (options.offersFrom === 1) {
+            prefix = 'trader_'
+        }
+        if (options.sessionMode !== 'regular') {
+            prefix = `${options.sessionMode}_` + prefix;
+        }
+    
+        if (itemScanned && itemId && !skipInsert) {
+            scanned = `, \`${prefix}last_scan\` = ?`;
+            escapedValues.push(options.timestamp ?? new Date());
+            if (options.offerCount && options.offersFrom !== 1) {
+                scanned += `, \`${prefix}last_offer_count\` = ?`;
+                escapedValues.push(options.offerCount);
+            }
+            setLastScan = true;
+        } else if (!itemScanned || skipInsert) {
+            where.push(`item_data.\`${prefix}checkout_scanner_id\` = ?`);
+            escapedValues.push(options.scanner.id);
+        }
+        if (itemId) {
+            where.push('item_data.id = ?');
+            escapedValues.push(itemId);
+        }
+        let sql = `
+            UPDATE item_data
+            SET \`${prefix}checkout_scanner_id\` = NULL${scanned}
+            WHERE ${where.join(' AND ')}
+        `;
+        try {
+            const result = await query(sql, escapedValues).then(result => {
+                if (setLastScan) {
+                    query(`
+                        UPDATE scanner
+                        SET \`${prefix}last_scan\` = now()
+                        WHERE id = ?
+                    `, [options.scanner.id]);
+                }
+                return result;
+            });
+            response.data = result.affectedRows;
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+        return response;
+    },
+    //on success, response.data is an array with the first element being the number of player prices inserted
+    //and the second element being the number of trader prices inserted
+    // requires options itemId, itemPrices, and offersFrom
+    // also uses trustTraderUnlocks optionally
+    // if offerCount is set, that will also be used for setting the item as scanned
+    /*the itemPrices option is an array of objects with the following structure:
+    [
+        {
+            seller: 'Player',
+            currency: 'RUB',
+            quest: null,
+            minLevel: null,
+            price: 9876
+        },
+        {
+            seller: 'Peacekeeper',
+            currency: 'USD',
+            quest: 42,
+            minLevel: null,
+            price: 1234
+        },
+        {
+            seller: 'Mechanic',
+            currency: 'EUR',
+            quest: null,
+            minLevel: 3,
+            price: 5678
+        }
+    ]
+    quest and minLevel are only used for trader prices.
+    If the trader price is locked and neither of these values is known, they should be null
+    */
+    insertPrices: async (options) => {
+        const user = options.user;
+        let scanFlags = options.scanner.flags;
+        const skipInsert = userFlags.skipPriceInsert & user.flags || scannerFlags.skipPriceInsert & scanFlags;
+        const response = {errors: [], warnings: [], data: [0, 0]};
+        const itemId = options.itemId;
+        let itemPrices = options.itemPrices;
+        let gameMode = 0;
+        for (const gm of gameModes) {
+            if (gm.name !== options.sessionMode) {
+                continue;
+            }
+            gameMode = gm.value;
+            break;
+        }
+        if (!itemId) {
+            response.errors.push('no item id specified');
+        }
+        if (!itemPrices){
+            response.errors.push('no prices to insert');
+        }
+        if (!Array.isArray(itemPrices)) {
+            itemPrices = [itemPrices];
+        }
+        if (itemPrices.length == 0) {
+            response.errors.push('no prices to insert');
+        }
+        if (response.errors.length > 0) {
+            return response;
+        }
+        if (presets[itemId]) {
+            presetData.presetUsed(itemId);
+        }
+        const playerPrices = [];
+        const traderPrices = [];
+        for (const itemPrice of itemPrices) {
+            // player prices are only rubles
+            if (itemPrice.seller === 'Player' && itemPrice.currency === 'RUB') {
+                playerPrices.push(itemPrice);
+            } else if (itemPrice.seller !== 'Player') {
+                traderPrices.push(itemPrice);
+            }
+        }
+        let playerInsert = Promise.resolve({affectedRows: 0});
+        let traderInsert = Promise.resolve({affectedRows: 0});
+        const insertDate = new Date();
+        if (playerPrices.length > 0 && userFlags.insertPlayerPrices & user.flags) {
+            // player prices
+            const placeholders = [];
+            const values = [];
+            for (const playerPrice of playerPrices) {
+                placeholders.push('(?, ?, ?, ?, ?)');
+                values.push(itemId, playerPrice.price, options.scanner.id, insertDate, gameMode);
+            }
+            if (skipInsert) {
+                response.warnings.push(`Skipped insert of ${playerPrices.length} player prices`);
+            } else {
+                playerInsert = query(`INSERT INTO price_data (item_id, price, scanner_id, timestamp, game_mode) VALUES ${placeholders.join(', ')}`, values).then(insertResult => {
+                    const summaryData = playerPrices.reduce((summary, current) => {
+                        summary.total += current.price;
+                        if (current.price < summary.min) {
+                            summary.min = current.price;
+                        }
+                        return summary;
+                    }, {count: playerPrices.length, total: 0, min: Number.MAX_SAFE_INTEGER});
+                    summaryData.avg = Math.round(summaryData.total / summaryData.count);
+                    return query('INSERT INTO price_historical (item_id, price_min, price_avg, offer_count, timestamp, game_mode) VALUES (?, ?, ?, ?, ?, ?)',[itemId, summaryData.min, summaryData.avg, options.offerCount, insertDate, gameMode]).then(() => insertResult);
+                });
+            }
+        } else if (playerPrices.length > 0) {
+            playerInsert = Promise.reject(new Error('User not authorized to insert player prices'));
+        }
+        if (traderPrices.length > 0 && userFlags.insertTraderPrices & user.flags) { 
+            // trader prices
+            //const traderPriceInserts = [];
+            const placeholders = [];
+            const traderValues = [];
+            for (let i = 0; i < traderPrices.length; i++) {
+                const tPrice = traderPrices[i];
+                let offerId = false;
+                const offerTest = await query(`
+                    SELECT id, currency, min_level, quest_unlock_id, quest_unlock_bsg_id FROM trader_items
+                    WHERE item_id=? AND trader_name=?
+                `, [itemId, tPrice.seller.toLowerCase()]);
+                if (offerTest.length > 0) {
+                    // offer exists
+                    if (options.trustTraderUnlocks && userFlags.trustTraderUnlocks & user.flags) {
+                        // can trust scanner min level & quest
+                        // attempt to match
+                        const matchedOffers = [];
+                        for (const offer of offerTest) {
+                            if (
+                                (tPrice.minLevel === null || offer.min_level === null || offer.min_level === tPrice.minLevel) && 
+                                (tPrice.quest === null || (offer.quest_unlock_id === null && offer.quest_unlock_bsg_id === null) || offer.quest_unlock_id == tPrice.quest || offer.quest_unlock_bsg_id == tPrice.quest)
+                            ) {
+                                matchedOffers.push(offer.id);
+                            }
+                        }
+                        if (matchedOffers.length === 1) {
+                            const matchedOffer = matchedOffers[0];
+                            offerId = matchedOffer.id;
+                            if (matchedOffer.min_level === null && tPrice.minLevel !== null) {
+                                try {
+                                    await query(`
+                                        UPDATE trader_items
+                                        SET min_level = ?, scanner_id = ?
+                                        WHERE id = ${matchedOffer.id}
+                                    `, [tPrice.minLevel, options.scanner.id]);
+                                } catch (error) {
+                                    response.warnings.push(`Failed updating minimum level for trader offer ${matchedOffer.id} to ${tPrice.minLevel}: ${error}`);
+                                }
+                            }
+                        } else if (matchedOffers.length > 1) {
+                            response.warnings.push(`${tPrice.seller} had ${matchedOffers.length} matching offers for ${itemId}, skipping price insert`);
+                        } else if (offerTest.length === 1) {
+                            const offer = offerTest[0];
+                            if (offer.min_level && tPrice.minLevel && offer.min_level !== tPrice.minLevel & options.trustTraderUnlocks && userFlags.trustTraderUnlocks & user.flags) {
+                                try {
+                                    await query(`
+                                        UPDATE trader_items
+                                        SET min_level = ?, scanner_id = ?
+                                        WHERE id = ${offer.id}
+                                    `, [tPrice.minLevel, options.scanner.id]);
+                                    offerId = offer.id;
+                                } catch (error) {
+                                    response.warnings.push(`Failed updating minimum level for trader offer ${offer.id} to ${tPrice.minLevel}: ${error}`);
+                                }
+                            }
+                        }
+                    } else if (offerTest.length === 1) {
+                        // easy match
+                        offerId = offerTest[0].id;
+                    } else {
+                        // can't trust scanner min level & quest; no way to match
+                        response.warnings.push(`${tPrice.seller} had ${offerTest.length} offers for ${itemId}, skipping price insert`)
+                    }
+                    if (offerId) {
+                        // we found a matching offer
+                        let offer = offerTest[0];
+                        const offerUpdateVars = ['timestamp = CURRENT_TIMESTAMP()'];
+                        const offerUpdateValues = [];
+                        if (offer.currency != tPrice.currency) {
+                            offerUpdateVars.push(`currency = ?`);
+                            offerUpdateValues.push(tPrice.currency)
+                        }
+                        if (options.trustTraderUnlocks && userFlags.trustTraderUnlocks & user.flags) {
+                            // only update if we can trust scanner info
+                            if (tPrice.minLevel !== null && offer.min_level != tPrice.minLevel) {
+                                offerUpdateVars.push(`min_level = ?`);
+                                offerUpdateValues.push(tPrice.minLevel);
+                            }
+                            if (isNaN(tPrice.quest)) {
+                                //bsg id
+                                if (offer.quest_unlock_bsg_id != tPrice.quest) {
+                                    if (tPrice.quest) {
+                                        offerUpdateVars.push(`quest_unlock_bsg_id = ?`);
+                                        offerUpdateValues.push(tPrice.quest);
+                                    } else {
+                                        offerUpdateVars.push('quest_unlock_id = NULL');
+                                        offerUpdateVars.push('quest_unlock_bsg_id = NULL');
+                                    }
+                                }
+                            } else {
+                                //tarkovdata id
+                                if (offer.quest_unlock_id != tPrice.quest) {
+                                    if (tPrice.quest) {
+                                        offerUpdateVars.push(`quest_unlock_id = ?`);
+                                        offerUpdateValues.push(tPrice.quest);
+                                    } else {
+                                        offerUpdateVars.push('quest_unlock_id = NULL');
+                                        offerUpdateVars.push('quest_unlock_bsg_id = NULL');
+                                    }
+                                }
+                            }
+                        }
+                        if (offerUpdateVars.length > 0) {
+                            // update this offer
+                            offerUpdateVars.push(`scanner_id = ?`);
+                            offerUpdateValues.push(options.scanner.id);
+                            await query(`UPDATE trader_items
+                                SET ${offerUpdateVars.join(', ')}
+                                WHERE id = '${offerId}'
+                            `, offerUpdateValues);
+                        }
+                    }
+                }
+                if (!offerId && options.trustTraderUnlocks && userFlags.trustTraderUnlocks & user.flags) {
+                    // offer does not exist, so we create it
+                    // but only if our trader data is reliable
+                    const offerValues = [itemId, tPrice.seller.toLowerCase(), tPrice.currency];
+                    let minLevel = 'NULL';
+                    if (tPrice.minLevel !== null) {
+                        minLevel = '?';
+                        offerValues.push(tPrice.minLevel);
+                    }
+                    let quest = 'NULL';
+                    let questIdField = 'quest_unlock_id';
+                    if (tPrice.quest !== null) {
+                        quest = '?';
+                        let questId = tPrice.quest;
+                        if (isNaN(tPrice.quest)) {
+                            questIdField = 'quest_unlock_bsg_id';
+                        } else {
+                            questId = parseInt(questId);
+                        }
+                        offerValues.push(questId);
+                    }
+                    offerValues.push(options.scanner.id);
+                    try {
+                        const result = await query(`
+                            INSERT INTO trader_items
+                            (item_id, trader_name, currency, min_level, ${questIdField}, timestamp, scanner_id) VALUES
+                            (?, ?, ?, ${minLevel}, ${quest}, CURRENT_TIMESTAMP(), ?)
+                        `, offerValues);
+                        offerId = result.insertId;
+                    } catch (error) {
+                        response.errors.push(String(error));
+                    }
+                }
+                if (offerId) {
+                    placeholders.push(`(?, ?, ?, now())`);
+                    traderValues.push(offerId, Math.ceil(tPrice.price), options.scanner.id);
+                }
+            }
+            if (traderValues.length > 0) {
+                if (skipInsert) {
+                    response.warnings.push(`Skipped insert of ${traderValues.length} trader prices`);
+                } else {
+                    traderInsert = query(`INSERT INTO trader_price_data (trade_id, price, scanner_id, timestamp) VALUES ${placeholders.join(', ')}`, traderValues);
+                }
+            } else {
+                traderInsert = Promise.reject(new Error(`Could not find any matching offers for ${itemId}`));
+            }
+        } else if (traderPrices.length > 0) {
+            traderInsert = Promise.reject(new Error('User not authorized to insert trader prices'));
+        }
+        const results = await Promise.allSettled([playerInsert, traderInsert]);
+        for (let i = 0; i < results.length; i++) {
+            if (results[i].status === 'rejected') {
+                response.errors.push(String(results[i].reason));
+                response.data[i] = String(results[i].reason);
+            } else {
+                response.data[i] = results[i].value.affectedRows
+            }
+        }
+        try {
+            if (response.errors.length < 1) {
+                await scannerApi.releaseItem({...options, scanned: true});
+            }
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+        return response;
+    },
+    insertSummaryPrices: async (options) => {
+        const user = options.user;
+        let scanFlags = options.scanner.flags;
+        const skipInsert = userFlags.skipPriceInsert & user.flags || scannerFlags.skipPriceInsert & scanFlags;
+        const response = {errors: [], warnings: [], data: {}};
+        const itemId = options.itemId;
+        const scanDateTime = options.timestamp ?? new Date();
+        let gameMode = 0;
+        for (const gm of gameModes) {
+            if (gm.name !== options.sessionMode) {
+                continue;
+            }
+            gameMode = gm.value;
+            break;
+        }
+        if (!options.min || !options.avg) {
+            response.errors.push('no prices to insert');
+        }
+        if (!itemId) {
+            response.errors.push('no id');
+        }
+        if (response.errors.length > 0) {
+            return response;
+        }
+        let scanned = false;
+        if (skipInsert) {
+            response.warnings.push(`Skipped insert of ${playerPrices.length} player prices`);
+        } else {
+            await query('INSERT INTO price_historical (item_id, price_min, price_avg, timestamp, game_mode) VALUES (?, ?, ?, ?, ?)',[itemId, options.min, options.avg, scanDateTime, gameMode]).then(() => {
+                scanned = true;
+            }).catch(error => {
+                response.errors.push(String(error));
+            });
+        }
+        await scannerApi.releaseItem({...options, scanned}).catch(error => {
+            response.errors.push(String(error));
+        });
+        return response;
+    },
+    addTraderOffers: async (options) => {
+        const response = {
+            data: [],
+            warnings: [],
+            errors: [],
+        };
+        const dataActions = [];
+        const scannedIds = options.offers.reduce((all, current) => {
+            if (!all.includes(current.item)) {
+                all.push(current.item);
+            }
+            return all;
+        }, []);
+        let gameMode = 0;
+        for (const gm of gameModes) {
+            if (gm.name !== options.sessionMode) {
+                continue;
+            }
+            gameMode = gm.value;
+            break;
+        }
+        for (const offer of options.offers) {
+            const insertValues = {
+                id: offer.offerId,
+                item_id: offer.item,
+                trader_id: offer.seller,
+                min_level: offer.minLevel,
+                buy_limit: offer.buyLimit,
+                restock_amount: offer.restockAmount,
+                game_mode: gameMode,
+            };
+            if (options.trustTraderUnlocks) {
+                insertValues.locked = offer.locked ? 1 : 0;
+            }
+            if (!offer.requirements) {
+                insertValues.price = offer.price;
+                insertValues.currency = offer.currency;
+            } else {
+                insertValues.price = null;
+                insertValues.currency = null;
+            }
+            if (presets[offer.item]) {
+                presetData.presetUsed(offer.item);
+            }
+            const updateValues = Object.keys(insertValues).reduce((all, current) => {
+                if (current !== 'id') {
+                    all[current] = insertValues[current];
+                }
+                return all;
+            }, {});
+            dataActions.push(query(`
+                INSERT INTO trader_offers
+                    (${Object.keys(insertValues).join(', ')}, last_scan)
+                VALUES
+                    (${Object.keys(insertValues).map(() => '?').join(', ')}, now())
+                ON DUPLICATE KEY UPDATE ${Object.keys(updateValues).map(field => `${field}=?`).join(', ')}, last_scan=now()
+            `, [...Object.values(insertValues), ...Object.values(updateValues)]).then(async () => {
+                if (offer.requirements) {
+                    await query(`DELETE FROM trader_offer_requirements WHERE offer_id=?`, [offer.offerId]);
+                    const requirementActions = [];
+                    for (const req of offer.requirements) {
+                        let properties = null;
+                        let itemId = req.item;
+                        if (req.level || remoteData.isDogtag(itemId)) {
+                            properties = JSON.stringify({
+                                level: req.level,
+                            });
+                        }
+                        if (remoteData.isDogtag(itemId) && req.side === 'Any') {
+                            itemId = remoteData.dogtagIds().any;
+                        }
+                        requirementActions.push(query(`
+                            INSERT INTO trader_offer_requirements
+                                (offer_id, requirement_item_id, count, properties)
+                            VALUES
+                                (?, ?, ?, ?)
+                            ON DUPLICATE KEY UPDATE count=?, properties=?
+                        `, [offer.offerId, itemId, req.count, properties, req.count, properties]));
+                    }
+                    return Promise.all(requirementActions).then(() => { 
+                        return { result: 'ok' };
+                    });
+                }
+                return { result: 'ok' };
+            }).catch(error => {
+                return {
+                    result: 'error',
+                    message: error.message,
+                };
+            }));
+        }
+        if (options.offersFrom === 1) {
+            await Promise.all(scannedIds.map(id => {
+                return scannerApi.releaseItem({...options, itemId: id, scanned: true});
+            }));
+        }
+        response.data = await Promise.all(dataActions);
+        return response;
+    },
+    currentTraderScans: async () => {
+        if (typeof activeTraderScans.regular === 'undefined') {
+            await refreshTraderScanStatus().catch(error => {
+                console.log('Error refreshing trader scan status:', error);
+            });
+        }
+        return activeTraderScans;
+    },
+    currentTraderScan: async (gameModeName) => {
+        await scannerApi.currentTraderScans();
+        return activeTraderScans[gameModeName];
+    },
+    startTraderScan: async (gameModeName) => {
+        const gameMode = gameModes.find(gm => gm.name === gameModeName) ?? gameModes.find(gm => gm.name === 'regular');
+        if (!activeTraderScans[gameModeName]) {
+            await query('INSERT INTO trader_offer_scan (game_mode) VALUES (?)', [gameMode.value]);
+            await refreshTraderScanStatus();
+        }
+        if (!activeTraderScans[gameModeName]) {
+            return {
+                data: false,
+            }
+        }
+        return {
+            data: {
+                id: activeTraderScans[gameModeName].id,
+                started: activeTraderScans[gameModeName].started,
+            }
+        }
+    },
+    setTraderScanScanner: async (gameModeName, scannerName) => {
+        if (!activeTraderScans[gameModeName]) {
+            return Promise.reject(new Error(`Cannot set ${gameModeName} trader scan scanner with no active trader scan`));
+        }
+        const gameMode = gameModes.find(gm => gm.name === gameModeName) ?? gameModes.find(gm => gm.name === 'regular');
+        return query('UPDATE trader_offer_scan SET scanner_name = ? WHERE id = ? AND game_mode = ?', [scannerName, activeTraderScans[gameModeName].id, gameMode.value]).then(result => {
+            activeTraderScans[gameModeName].scanner_name = scannerName;
+            return result;
+        });
+    },
+    submitJson: (options) => {
+        const response = {errors: [], warnings: [], data: {}};
+        try {
+            const filename = path.basename(options.name);
+            fs.writeFileSync(path.join(import.meta.dirname, '..', 'cache', `${filename}.json`), JSON.stringify(options.data, null, 4));
+            response.data.filename = filename;
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                response.errors.push(`Error: ${options.file} not found`);
+            } else {
+                response.errors.push(String(error));
+            }
+        }
+        return response;
+    },
+    /* options has the format:
+    {
+        images: { ... }, // id:image collection of all images
+        // images values can be either string file paths or sharp objects
+        overwrite: true, // whether existing images should be overwritten
+    }
+    typically, this will be an item image and its presets if it has any
+    */
+    submitSourceImages: async (options) => {
+        const response = {errors: [], warnings: [], data: []};
+    
+        if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+            response.errors.push('aws variables not configured; image upload disabled');
+            return response;
+        }
+
+        const allItemData = await remoteData.get();
+
+        try {
+            for (const itemId in options.images) {
+                const itemData = allItemData.get(itemId);
+                if (!itemData) {
+                    response.errors.push(`Item ${itemId} not found`);
+                    continue;
+                }
+                response.data.push(await createAndUploadFromSource(options.images[itemId], itemId, options.overwrite));
+            }
+        } catch (error) {
+            console.error(error);
+            if (Array.isArray(error)) {
+                response.errors.push(...error.map(err => String(err)));
+            } else {
+                response.errors.push(String(error));
+            }
+        }
+
+        return response;
+    },
+    submitItemSourceImage: async (options) => {
+        const response = {errors: [], warnings: [], data: []};
+
+        try {
+            if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+                throw new Error('aws variables not configured; image upload disabled');
+            }
+
+            if (!options.id) {
+                throw new Error('No id provided');
+            }
+
+            if (!options.image) {
+                throw new Error('No image provided');
+            }
+
+            const allItemData = await remoteData.get();
+            const itemData = allItemData.get(options.id);
+            if (!itemData) {
+                throw new Error(`Item ${options.id} not found`);
+            }
+            response.data.push(await createAndUploadFromSource(options.image, options.id, options.overwrite));
+        } catch (error) {
+            response.errors.push(String(error));
+        }
+
+        return response;
+    },
+    // options has properties: id, type, image, overwrite
+    // id is the item id, type is the type of image, 
+    // image is the string file path or a sharp object, and
+    // overwrite is whether to overwrite existing images
+    submitImage: async (options, user) => {
+        const response = {errors: [], warnings: [], data: []};
+
+        if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+            response.errors.push('aws variables not configured; image upload disabled');
+            return response;
+        }
+
+        if(!Object.keys(imageSizes).includes(options.type)) {
+            console.log(`Invalid image type: ${options.type}`);
+            response.errors.push(`Invalid image type: ${options.type}`);
+            return response;
+        }
+
+        const allItemData = await remoteData.get();
+        const currentItemData = allItemData.get(options.id);
+        const checkImageExists = imageType => {
+            const field = imageSizes[imageType].field;
+            return currentItemData[field];
+        };
+
+        if (checkImageExists(options.type) && !options.overwrite && !(scannerApi.userFlags.overwriteImages & user.flags)) {
+            console.log(`Item ${options.id} already has a ${options.type}`);
+            response.errors.push(`Item ${options.id} already has a ${options.type}`);
+            return response;
+        }
+
+        try {
+            response.data.push({
+                type: options.type,
+                purged: await uploadToS3(options.image, options.type, options.id)
+            });
+        } catch (error) {
+            console.error(error);
+            if (Array.isArray(error)) {
+                response.errors.push(...error.map(err => String(err)));
+            } else {
+                response.errors.push(String(error));
+            }
+        }
+
+        return response;
+    },
+    createPresetFromOffer: async (offer, presetImage = false) => {
+        if (!presetImage) {
+            presetImage = await tarkovDevData.fenceFetchImage('/preset-image', {
+                method: 'POST',
+                body: JSON.stringify(reward),
+            });
+        }
+        const newPreset = await presetData.addJsonPreset(offer);
+        await createAndUploadFromSource(presetImage, newPreset.id);
+        return {
+            id: newPreset.id,
+            name: newPreset.name,
+            shortName: newPreset.short_name,
+            types: newPreset.types,
+            backgroundColor: newPreset.backgroundColor,
+            width: newPreset.width,
+            height: newPreset.height,
+            default: newPreset.default,
+            items: newPreset.items,
+        };
+    },
+    addReplica: (replica) => {
+        replicas[replica.properties.source] = replica;
+    },
+    removeReplica: (id) => {
+        delete replicas[id];
+    },
+    on: (event, listener) => {
+        return emitter.on(event, listener);
+    },
+    off: (event, listener) => {
+        return emitter.off(event, listener);
+    },
+    once: (event, listener) => {
+        return emitter.once(event, listener);
+    },
+};
+
+export const getUsers = scannerApi.getUsers;
+
+export const getScanner = scannerApi.getScanner;
+
+export const refreshScannerUsers = scannerApi.refreshUsers;
+
+export default scannerApi;
