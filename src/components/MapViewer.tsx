@@ -164,7 +164,6 @@ export const MapViewer: React.FC<MapViewerProps> = ({ mapId, mapName, markers, a
         onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
       >
-        {/* Exact Fit Container matching SVG dimensions 1:1 without letterbox offset */}
         <div
           className="relative transition-transform duration-75 ease-out origin-center inline-block"
           style={{
@@ -194,7 +193,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ mapId, mapName, markers, a
           {/* Grid Overlay for Tactical Look */}
           <div className="absolute inset-0 border border-amber-500/10 rounded-2xl pointer-events-none bg-[radial-gradient(#334155_1px,transparent_1px)] [background-size:24px_24px] opacity-20" />
 
-          {/* Quest Markers Layer aligned 1:1 with SVG image bounds */}
+          {/* Quest Markers Layer */}
           {markers.map((marker) => (
             <div
               key={marker.id}
@@ -238,6 +237,9 @@ export const MapViewer: React.FC<MapViewerProps> = ({ mapId, mapName, markers, a
                   {selectedMarker.traderName}
                 </span>
                 <h4 className="text-white font-bold text-base mt-1">{selectedMarker.questTitle}</h4>
+                {selectedMarker.questTitleEn && selectedMarker.questTitleEn !== selectedMarker.questTitle && (
+                  <p className="text-xs text-zinc-400 font-medium">{selectedMarker.questTitleEn}</p>
+                )}
               </div>
             </div>
             <button

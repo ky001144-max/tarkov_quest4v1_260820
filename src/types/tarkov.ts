@@ -39,6 +39,7 @@ export interface Objective {
   id: string | number;
   type: string;
   description?: string;
+  descriptionKo?: string;
   target?: string | string[];
   number?: number;
   location?: number | string;
@@ -53,7 +54,8 @@ export interface Objective {
 export interface Quest {
   id: string | number;
   gameId?: string;
-  title: string;
+  title: string; // Korean title (e.g. "데뷔")
+  titleEn: string; // English title (e.g. "Debut")
   locales?: {
     en?: string;
     ko?: string;
@@ -87,6 +89,7 @@ export interface MapMarker {
   id: string;
   questId: string | number;
   questTitle: string;
+  questTitleEn?: string;
   traderName: string;
   objectiveId: string | number;
   objectiveType: string;

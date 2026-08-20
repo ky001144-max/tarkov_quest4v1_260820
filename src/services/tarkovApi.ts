@@ -1,5 +1,5 @@
 import type { Quest, Trader, MapInfo } from '../types/tarkov';
-import { loadItemData, resolveItemName } from '../utils/itemResolver';
+import { loadItemData, loadKoLocale, getKoreanQuestTitle, formatKoreanObjective, resolveItemName } from '../utils/itemResolver';
 
 export const TRADERS: Trader[] = [
   { id: 0, name: 'Prapor', avatarUrl: 'https://assets.tarkov.dev/prapor-icon.jpg' },
@@ -84,8 +84,8 @@ query GetTarkovData {
 `;
 
 export async function fetchQuestsData(): Promise<Quest[]> {
-  // Load item-data.json for MongoID to readable item name resolution
   const itemMap = await loadItemData();
+  const koLocale = await loadKoLocale();
 
   // Load removed quests dictionary for filtering PvP removed/disabled quests
   let removedQuestMap: Record<string, string> = {};
@@ -95,7 +95,7 @@ export async function fetchQuestsData(): Promise<Quest[]> {
       removedQuestMap = await removedRes.json();
     }
   } catch (e) {
-    console.warn('Could not load removed_quests.json, proceeding with default filter:', e);
+    console.warn('Could not load removed_quests.json:', e);
   }
 
   const removedKeys = new Set(Object.keys(removedQuestMap));
@@ -124,25 +124,30 @@ export async function fetchQuestsData(): Promise<Quest[]> {
       if (result?.data?.tasks && Array.isArray(result.data.tasks) && result.data.tasks.length > 0) {
         return result.data.tasks
           .filter((task: any) => isQuestActiveInPVP(task.id, task.id, task.name))
-          .map((task: any) => ({
-            id: task.id,
-            title: task.name,
-            minPlayerLevel: task.minPlayerLevel || 1,
-            wiki: task.wikiLink,
-            giver: {
-              id: task.trader?.id || 'unknown',
-              name: task.trader?.name || 'Unknown Trader',
-              avatarUrl: task.trader?.imageLink,
-            },
-            map: task.map ? { id: task.map.id, name: task.map.name, normalizedName: task.map.normalizedName } : undefined,
-            objectives: (task.objectives || []).map((obj: any) => ({
-              id: obj.id,
-              type: obj.type || 'objective',
-              description: resolveItemName(obj.description, itemMap),
-              optional: obj.optional,
-              zones: obj.zones,
-            })),
-          }));
+          .map((task: any) => {
+            const titleKo = getKoreanQuestTitle(task.id, task.name, koLocale);
+            return {
+              id: task.id,
+              title: titleKo,
+              titleEn: task.name,
+              minPlayerLevel: task.minPlayerLevel || 1,
+              wiki: task.wikiLink,
+              giver: {
+                id: task.trader?.id || 'unknown',
+                name: task.trader?.name || 'Unknown Trader',
+                avatarUrl: task.trader?.imageLink,
+              },
+              map: task.map ? { id: task.map.id, name: task.map.name, normalizedName: task.map.normalizedName } : undefined,
+              objectives: (task.objectives || []).map((obj: any) => ({
+                id: obj.id,
+                type: obj.type || 'objective',
+                description: obj.description,
+                descriptionKo: formatKoreanObjective(obj, itemMap, koLocale),
+                optional: obj.optional,
+                zones: obj.zones,
+              })),
+            };
+          });
       }
     }
   } catch (e) {
@@ -163,11 +168,13 @@ export async function fetchQuestsData(): Promise<Quest[]> {
       const mapName = q.objectives?.find((o: any) => o.location >= 0)?.location;
       const mapId = mapName !== undefined ? LOCATION_MAP_NAMES[mapName] : undefined;
       const matchedMap = mapId ? MAPS.find((m) => m.id === mapId) : undefined;
+      const titleKo = getKoreanQuestTitle(q.gameId, q.title, koLocale);
 
       return {
         id: q.id,
         gameId: q.gameId,
-        title: q.title,
+        title: titleKo,
+        titleEn: q.title,
         locales: q.locales,
         wiki: q.wiki,
         giver: giverTrader,
@@ -175,48 +182,16 @@ export async function fetchQuestsData(): Promise<Quest[]> {
         map: matchedMap,
         exp: q.exp,
         objectives: (q.objectives || []).map((obj: any) => {
-          const resolvedTarget = resolveItemName(obj.target, itemMap);
-          const resolvedTool = resolveItemName(obj.tool, itemMap);
-          const resolvedWith = obj.with ? resolveItemName(obj.with, itemMap) : undefined;
-
-          // Generate human readable description
-          let desc = obj.hint ? resolveItemName(obj.hint, itemMap) : '';
-          if (!desc && resolvedTarget) {
-            switch (obj.type) {
-              case 'key':
-                desc = `Obtain key: ${resolvedTarget}`;
-                break;
-              case 'pickup':
-                desc = `Pickup: ${resolvedTarget}`;
-                break;
-              case 'place':
-                desc = `Place item: ${resolvedTarget}`;
-                break;
-              case 'collect':
-                desc = `Collect: ${resolvedTarget}${obj.number ? ` (${obj.number} pcs)` : ''}`;
-                break;
-              case 'find':
-                desc = `Find in raid: ${resolvedTarget}${obj.number ? ` (${obj.number} pcs)` : ''}`;
-                break;
-              case 'mark':
-                desc = `Mark ${resolvedTarget}${resolvedTool ? ` using ${resolvedTool}` : ''}`;
-                break;
-              case 'kill':
-                desc = `Kill ${resolvedTarget}${obj.number ? ` (${obj.number})` : ''}${resolvedWith ? ` with ${resolvedWith}` : ''}`;
-                break;
-              default:
-                desc = `${obj.type}: ${resolvedTarget}`;
-            }
-          }
-
-          if (!desc) {
-            desc = obj.type || 'Task objective';
-          }
+          const resolvedTarget = resolveItemName(obj.target, itemMap, koLocale);
+          const resolvedTool = resolveItemName(obj.tool, itemMap, koLocale);
+          const resolvedWith = obj.with ? resolveItemName(obj.with, itemMap, koLocale) : undefined;
+          const descKo = formatKoreanObjective(obj, itemMap, koLocale);
 
           return {
             id: obj.id,
             type: obj.type,
-            description: desc,
+            description: obj.hint || obj.target ? `${obj.type}: ${resolvedTarget}` : obj.type,
+            descriptionKo: descKo,
             target: resolvedTarget,
             number: obj.number,
             location: obj.location,

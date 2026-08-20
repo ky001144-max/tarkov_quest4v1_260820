@@ -72,7 +72,6 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
       const questMapId = quest.map?.id || quest.map?.normalizedName;
       const targetMapId = selectedMap.toLowerCase();
 
-      // Check if quest has matching map or any objective matching map
       const hasMapMatch =
         (questMapId && questMapId.toLowerCase().includes(targetMapId)) ||
         quest.objectives.some(
@@ -90,11 +89,12 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
     // 4. Search Query
     if (searchQuery.trim() !== '') {
       const q = searchQuery.toLowerCase();
-      const titleMatch = quest.title.toLowerCase().includes(q);
+      const titleKoMatch = quest.title.toLowerCase().includes(q);
+      const titleEnMatch = (quest.titleEn || '').toLowerCase().includes(q);
       const traderMatch = (typeof quest.giver === 'object' ? quest.giver.name : String(quest.giver)).toLowerCase().includes(q);
-      const objMatch = quest.objectives.some((o) => o.description?.toLowerCase().includes(q) || String(o.target).toLowerCase().includes(q));
+      const objMatch = quest.objectives.some((o) => (o.descriptionKo || o.description || '').toLowerCase().includes(q) || String(o.target).toLowerCase().includes(q));
 
-      if (!titleMatch && !traderMatch && !objMatch) {
+      if (!titleKoMatch && !titleEnMatch && !traderMatch && !objMatch) {
         return false;
       }
     }
@@ -123,7 +123,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
           <input
             type="text"
-            placeholder="퀘스트, 상인, 아이템 검색..."
+            placeholder="퀘스트(한글/영어), 상인, 아이템 검색..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-9 pr-4 py-2 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-amber-500/60 transition-colors"
@@ -206,7 +206,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                     : 'bg-zinc-950/40 border-zinc-800/80 hover:border-zinc-700/80'
                 }`}
               >
-                {/* Quest Item Header */}
+                {/* Quest Item Header with Dual Titles (KO on top, EN on bottom) */}
                 <div
                   onClick={(e) => toggleExpandQuest(quest.id, e)}
                   className="p-3.5 flex items-start gap-3 cursor-pointer select-none group hover:bg-zinc-800/40 transition-colors"
@@ -217,7 +217,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                       e.stopPropagation();
                       onToggleQuest(quest.id);
                     }}
-                    className={`mt-0.5 transition-colors ${isAccepted ? 'text-amber-400' : 'text-zinc-600 hover:text-zinc-400'}`}
+                    className={`mt-1 transition-colors ${isAccepted ? 'text-amber-400' : 'text-zinc-600 hover:text-zinc-400'}`}
                     title={isAccepted ? '퀘스트 해제' : '퀘스트 수락'}
                   >
                     {isAccepted ? <CheckSquare size={18} /> : <Square size={18} />}
@@ -231,25 +231,33 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                       <span className="text-[11px] text-zinc-500 font-mono">Lvl {quest.minPlayerLevel}+</span>
                     </div>
 
-                    <h3 className="text-sm font-semibold text-zinc-100 mt-1 truncate group-hover:text-amber-300 transition-colors">
-                      {quest.title}
-                    </h3>
+                    {/* Dual Quest Titles */}
+                    <div className="mt-1">
+                      <h3 className="text-sm font-bold text-zinc-100 truncate group-hover:text-amber-300 transition-colors">
+                        {quest.title}
+                      </h3>
+                      {quest.titleEn && quest.titleEn !== quest.title && (
+                        <p className="text-[11px] text-zinc-400 font-medium truncate mt-0.5">
+                          {quest.titleEn}
+                        </p>
+                      )}
+                    </div>
                   </div>
 
                   {/* Accordion Expand Icon */}
                   <button
                     onClick={(e) => toggleExpandQuest(quest.id, e)}
-                    className="p-1 rounded-lg text-zinc-500 hover:text-zinc-200 transition-colors"
+                    className="p-1 rounded-lg text-zinc-500 hover:text-zinc-200 transition-colors mt-1"
                   >
                     {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                   </button>
                 </div>
 
-                {/* Quest Accordion Content (Detailed Objectives) */}
+                {/* Quest Accordion Content (Detailed Korean Objectives) */}
                 {isExpanded && (
                   <div className="px-3.5 pb-3.5 pt-1 bg-zinc-950/70 border-t border-zinc-800/60 space-y-2.5 animate-in fade-in duration-150">
                     <div className="flex items-center justify-between text-xs text-zinc-400 font-medium">
-                      <span className="flex items-center gap-1 text-amber-400/90">
+                      <span className="flex items-center gap-1 text-amber-400/90 font-semibold">
                         <Target size={13} />
                         퀘스트 목표 목록 ({quest.objectives.length})
                       </span>
@@ -265,28 +273,25 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                       )}
                     </div>
 
-                    {/* Objectives List */}
+                    {/* Objectives List in Korean */}
                     <div className="space-y-1.5">
                       {quest.objectives.map((obj, idx) => (
                         <div
                           key={obj.id || idx}
-                          className="p-2 rounded-lg bg-zinc-900/80 border border-zinc-800 text-xs space-y-1"
+                          className="p-2.5 rounded-lg bg-zinc-900/80 border border-zinc-800 text-xs space-y-1"
                         >
                           <div className="flex items-start gap-2">
-                            <span className="text-amber-500 font-bold uppercase text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">
-                              {obj.type}
-                            </span>
-                            <span className="text-zinc-200 flex-1 leading-snug">
-                              {obj.description || (obj.target ? `${obj.target}` : '목표 정보')}
+                            <span className="text-zinc-200 flex-1 leading-snug font-medium">
+                              {obj.descriptionKo || obj.description || (obj.target ? `${obj.target}` : '목표 수행')}
                             </span>
                           </div>
 
                           {obj.number && (
-                            <p className="text-[11px] text-zinc-400 pl-2">수량: {obj.number}개</p>
+                            <p className="text-[11px] text-zinc-400 pl-1">필요 수량: {obj.number}개</p>
                           )}
                           {obj.gps && (
-                            <p className="text-[11px] text-amber-400/80 pl-2 flex items-center gap-1">
-                              📍 2D 좌표: ({obj.gps.leftPercent}%, {obj.gps.topPercent}%)
+                            <p className="text-[11px] text-amber-400/80 pl-1 flex items-center gap-1">
+                              📍 2D 지도 좌표: ({obj.gps.leftPercent}%, {obj.gps.topPercent}%)
                             </p>
                           )}
                         </div>

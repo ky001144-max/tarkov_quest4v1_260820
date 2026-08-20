@@ -119,16 +119,17 @@ export function extractQuestMarkersForMap(
     quest.objectives.forEach((obj) => {
       let matched = false;
 
-      // 1. Direct GPS % coordinates (DB contains raw normalized % for standard maps)
+      // 1. Direct GPS % coordinates
       if (obj.gps && obj.gps.leftPercent !== undefined && obj.gps.topPercent !== undefined) {
         markers.push({
           id: `marker-${quest.id}-${obj.id}`,
           questId: quest.id,
           questTitle: quest.title,
+          questTitleEn: quest.titleEn,
           traderName: typeof quest.giver === 'object' ? quest.giver.name : String(quest.giver),
           objectiveId: obj.id,
           objectiveType: obj.type || 'objective',
-          objectiveText: obj.description || obj.target ? `${obj.type}: ${Array.isArray(obj.target) ? obj.target.join(', ') : obj.target}` : 'Task Objective',
+          objectiveText: obj.descriptionKo || obj.description || (obj.target ? `${obj.type}: ${Array.isArray(obj.target) ? obj.target.join(', ') : obj.target}` : '목표 정보'),
           mapId: targetMapId,
           xPercent: obj.gps.leftPercent,
           yPercent: obj.gps.topPercent,
@@ -149,10 +150,11 @@ export function extractQuestMarkersForMap(
                 id: `marker-${quest.id}-${obj.id}-${zoneIdx}`,
                 questId: quest.id,
                 questTitle: quest.title,
+                questTitleEn: quest.titleEn,
                 traderName: typeof quest.giver === 'object' ? quest.giver.name : String(quest.giver),
                 objectiveId: obj.id,
                 objectiveType: obj.type || 'zone',
-                objectiveText: obj.description || `Zone Objective (${zone.position.x.toFixed(1)}, ${zone.position.z.toFixed(1)})`,
+                objectiveText: obj.descriptionKo || obj.description || `구역 목표 (${zone.position.x.toFixed(1)}, ${zone.position.z.toFixed(1)})`,
                 mapId: targetMapId,
                 xPercent: coords.leftPercent,
                 yPercent: coords.topPercent,
