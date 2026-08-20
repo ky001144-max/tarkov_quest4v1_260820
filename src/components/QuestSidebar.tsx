@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { Quest, Trader, MapInfo } from '../types/tarkov';
+import { LOCATION_MAP_NAMES } from '../services/tarkovApi';
 import {
   ChevronDown,
   ChevronRight,
@@ -67,19 +68,43 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
       }
     }
 
-    // 3. Map Filter
+    // 3. Map Filter - strictly filter out quests with no location (Gunsmith, hideout, etc.) when a specific map is selected
     if (selectedMap !== 'all') {
-      const questMapId = quest.map?.id || quest.map?.normalizedName;
-      const targetMapId = selectedMap.toLowerCase();
+      const normTarget = selectedMap.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let hasMapMatch = false;
 
-      const hasMapMatch =
-        (questMapId && questMapId.toLowerCase().includes(targetMapId)) ||
-        quest.objectives.some(
-          (o) =>
-            o.location === undefined ||
-            String(o.location).toLowerCase().includes(targetMapId) ||
-            o.zones?.some((z) => z.map?.name?.toLowerCase().includes(targetMapId))
-        );
+      // 3-1. Direct quest map property
+      if (quest.map && (quest.map.id || quest.map.normalizedName)) {
+        const questMapStr = (quest.map.id || quest.map.normalizedName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (questMapStr.includes(normTarget) || normTarget.includes(questMapStr)) {
+          hasMapMatch = true;
+        }
+      }
+
+      // 3-2. Objective locations
+      if (!hasMapMatch) {
+        hasMapMatch = quest.objectives.some((o) => {
+          // Ignore location: -1, undefined, null (location-less quests)
+          if (o.location !== undefined && o.location !== null && o.location !== -1 && o.location !== '-1') {
+            const mapName = LOCATION_MAP_NAMES[Number(o.location)] || String(o.location);
+            const normMapName = mapName.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (normMapName.includes(normTarget) || normTarget.includes(normMapName)) {
+              return true;
+            }
+          }
+          // Check 3D zones
+          if (o.zones && o.zones.length > 0) {
+            return o.zones.some((z) => {
+              if (z.map && z.map.name) {
+                const normZoneMap = z.map.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+                return normZoneMap.includes(normTarget) || normTarget.includes(normZoneMap);
+              }
+              return false;
+            });
+          }
+          return false;
+        });
+      }
 
       if (!hasMapMatch) {
         return false;
@@ -206,7 +231,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                     : 'bg-zinc-950/40 border-zinc-800/80 hover:border-zinc-700/80'
                 }`}
               >
-                {/* Quest Item Header with Dual Titles (KO on top, EN on bottom) */}
+                {/* Quest Item Header */}
                 <div
                   onClick={(e) => toggleExpandQuest(quest.id, e)}
                   className="p-3.5 flex items-start gap-3 cursor-pointer select-none group hover:bg-zinc-800/40 transition-colors"
@@ -253,7 +278,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
                   </button>
                 </div>
 
-                {/* Quest Accordion Content (Detailed Korean Objectives) */}
+                {/* Quest Accordion Content */}
                 {isExpanded && (
                   <div className="px-3.5 pb-3.5 pt-1 bg-zinc-950/70 border-t border-zinc-800/60 space-y-2.5 animate-in fade-in duration-150">
                     <div className="flex items-center justify-between text-xs text-zinc-400 font-medium">
@@ -304,7 +329,7 @@ export const QuestSidebar: React.FC<QuestSidebarProps> = ({
           })
         ) : (
           <div className="p-8 text-center text-zinc-500 text-sm">
-            검색 결과에 맞는 퀘스트가 없습니다.
+            해당 조건 또는 지도에 연관된 퀘스트가 없습니다.
           </div>
         )}
       </div>
