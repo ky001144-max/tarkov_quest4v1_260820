@@ -1,11 +1,13 @@
 let itemDataCache: Record<string, { id: string; name: string; shortname?: string }> | null = null;
 let koLocaleCache: Record<string, string> | null = null;
 
+const BASE = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+
 export async function loadItemData(): Promise<Record<string, { id: string; name: string; shortname?: string }>> {
   if (itemDataCache) return itemDataCache;
 
   try {
-    const res = await fetch('/data/item-data.json');
+    const res = await fetch(`${BASE}data/item-data.json`);
     if (res.ok) {
       itemDataCache = await res.json();
       return itemDataCache || {};
@@ -20,7 +22,7 @@ export async function loadKoLocale(): Promise<Record<string, string>> {
   if (koLocaleCache) return koLocaleCache;
 
   try {
-    const res = await fetch('/data/ko.json');
+    const res = await fetch(`${BASE}data/ko.json`);
     if (res.ok) {
       koLocaleCache = await res.json();
       return koLocaleCache || {};

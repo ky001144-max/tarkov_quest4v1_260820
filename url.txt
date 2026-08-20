@@ -1,1 +1,1 @@
-http://localhost:5173/
+https://ky001144-max.github.io/tarkov_quest4v1_260820/

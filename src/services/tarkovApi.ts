@@ -87,10 +87,12 @@ export async function fetchQuestsData(): Promise<Quest[]> {
   const itemMap = await loadItemData();
   const koLocale = await loadKoLocale();
 
+  const BASE = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+
   // Load removed quests dictionary for filtering PvP removed/disabled quests
   let removedQuestMap: Record<string, string> = {};
   try {
-    const removedRes = await fetch('/data/removed_quests.json');
+    const removedRes = await fetch(`${BASE}data/removed_quests.json`);
     if (removedRes.ok) {
       removedQuestMap = await removedRes.json();
     }
@@ -155,7 +157,7 @@ export async function fetchQuestsData(): Promise<Quest[]> {
   }
 
   // 2. Fallback to local quest-data.json
-  const localRes = await fetch('/data/quest-data.json');
+  const localRes = await fetch(`${BASE}data/quest-data.json`);
   if (!localRes.ok) {
     throw new Error('Failed to load local quest data');
   }

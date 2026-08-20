@@ -9,20 +9,22 @@ interface MapViewerProps {
   activeCount: number;
 }
 
-export const LOCAL_MAP_URLS: Record<string, string> = {
-  customs: '/maps/customs.svg',
-  woods: '/maps/woods.svg',
-  shoreline: '/maps/shoreline.svg',
-  interchange: '/maps/interchange.svg',
-  reserve: '/maps/reserve.svg',
-  lighthouse: '/maps/lighthouse.svg',
-  streets: '/maps/streets.svg',
-  factory: '/maps/factory.svg',
-  labs: '/maps/labs.svg',
-  'ground-zero': '/maps/ground-zero.svg',
+const BASE = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+
+const LOCAL_MAP_URLS: Record<string, string> = {
+  customs: `${BASE}maps/customs.svg`,
+  woods: `${BASE}maps/woods.svg`,
+  shoreline: `${BASE}maps/shoreline.svg`,
+  interchange: `${BASE}maps/interchange.svg`,
+  reserve: `${BASE}maps/reserve.svg`,
+  lighthouse: `${BASE}maps/lighthouse.svg`,
+  streets: `${BASE}maps/streets.svg`,
+  factory: `${BASE}maps/factory.svg`,
+  labs: `${BASE}maps/labs.svg`,
+  'ground-zero': `${BASE}maps/ground-zero.svg`,
 };
 
-export const ONLINE_FALLBACK_URLS: Record<string, string> = {
+const ONLINE_FALLBACK_URLS: Record<string, string> = {
   customs: 'https://raw.githubusercontent.com/the-hideout/tarkov-dev-svg-maps/main/Customs.svg',
   woods: 'https://raw.githubusercontent.com/the-hideout/tarkov-dev-svg-maps/main/Woods.svg',
   shoreline: 'https://raw.githubusercontent.com/the-hideout/tarkov-dev-svg-maps/main/Shoreline.svg',
@@ -44,7 +46,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ mapId, mapName, markers, a
 
   const normalizedMapId = mapId.toLowerCase();
   const [currentImgSrc, setCurrentImgSrc] = useState<string>(
-    LOCAL_MAP_URLS[normalizedMapId] || ONLINE_FALLBACK_URLS[normalizedMapId] || '/maps/customs.svg'
+    LOCAL_MAP_URLS[normalizedMapId] || ONLINE_FALLBACK_URLS[normalizedMapId] || `${BASE}maps/customs.svg`
   );
   const [mapLoadError, setMapLoadError] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -54,7 +56,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ mapId, mapName, markers, a
     setPosition({ x: 0, y: 0 });
     setSelectedMarker(null);
     setMapLoadError(false);
-    setCurrentImgSrc(LOCAL_MAP_URLS[normalizedMapId] || ONLINE_FALLBACK_URLS[normalizedMapId] || '/maps/customs.svg');
+    setCurrentImgSrc(LOCAL_MAP_URLS[normalizedMapId] || ONLINE_FALLBACK_URLS[normalizedMapId] || `${BASE}maps/customs.svg`);
   }, [mapId, normalizedMapId]);
 
   const handleImageError = () => {
